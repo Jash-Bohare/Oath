@@ -37,6 +37,7 @@ library ValuationLib {
     /// @param a1 Amount of currency1 (raw units).
     /// @param sqrtPriceX96 Mark price as `sqrt(P)·2^96`, `P` = raw currency1 per raw currency0.
     /// @return Value in raw currency1 units.
+    // forge-lint: disable-next-line(internal-function-used-once)
     function value(uint256 a0, uint256 a1, uint160 sqrtPriceX96) internal pure returns (uint256) {
         return a1 + FullMath.mulDiv(FullMath.mulDiv(a0, sqrtPriceX96, FixedPoint96.Q96), sqrtPriceX96, FixedPoint96.Q96);
     }
@@ -53,6 +54,7 @@ library ValuationLib {
     /// @param sqrtPriceX96 Mark price `sP`.
     /// @return amount0 Currency0 in the position.
     /// @return amount1 Currency1 in the position.
+    // forge-lint: disable-next-line(internal-function-used-once)
     function principal(uint128 liquidity, int24 tickLower, int24 tickUpper, uint160 sqrtPriceX96)
         internal
         pure
