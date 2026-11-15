@@ -7,6 +7,14 @@ import {TickMath} from "@uniswap/v4-core/src/libraries/TickMath.sol";
 import {BenchmarkLib} from "../../src/libraries/BenchmarkLib.sol";
 import {ValuationLib} from "../../src/libraries/ValuationLib.sol";
 import {IOathVault} from "../../src/interfaces/IOathVault.sol";
+import {IPoolManager} from "@uniswap/v4-core/src/interfaces/IPoolManager.sol";
+import {IHooks} from "@uniswap/v4-core/src/interfaces/IHooks.sol";
+import {StateLibrary} from "@uniswap/v4-core/src/libraries/StateLibrary.sol";
+import {PoolKey} from "@uniswap/v4-core/src/types/PoolKey.sol";
+import {PoolId} from "@uniswap/v4-core/src/types/PoolId.sol";
+import {BalanceDelta} from "@uniswap/v4-core/src/types/BalanceDelta.sol";
+import {ModifyLiquidityParams} from "@uniswap/v4-core/src/types/PoolOperation.sol";
+import {OathTestBase} from "../utils/OathTestBase.sol";
 
 /// @notice Pure tests for BenchmarkLib (02_MATH §6). Expected values come from the high-precision reference
 ///         model; the 02_MATH §9.1 inputs are real (start TWAP tick −199196, V_S = $30,000).
@@ -160,5 +168,93 @@ contract BenchmarkLibTest is Test {
 
     function _sqrt(int24 tick) internal pure returns (uint160) {
         return TickMath.getSqrtPriceAtTick(tick);
+    }
+}
+
+/// @notice The benchmark identity on the real PoolManager (07_TEST_PLAN §2): a real full-range position of
+///         `L_b`, added at the start price, withdraws exactly the principal and fees `valueAt` computes from
+///         two fee-growth reads, to the wei, after any sequence of swaps and donations.
+contract BenchmarkLibPoolTest is OathTestBase {
+    using StateLibrary for IPoolManager;
+
+    int24 internal constant START_TICK = -199196; // 02_MATH §9.1
+    bytes32 internal constant BENCH_SALT = bytes32(uint256(7));
+
+    PoolKey internal poolKey;
+
+    function setUp() public override {
+        super.setUp();
+        poolKey = PoolKey(currency0, currency1, POOL_FEE, TICK_SPACING, IHooks(address(0)));
+        manager.initialize(poolKey, TickMath.getSqrtPriceAtTick(START_TICK));
+        // Background: deep full range plus a concentrated band, like a real pool's layout.
+        (int24 tickMin, int24 tickMax) = _fullRange();
+        modifyLiquidityRouter.modifyLiquidity(
+            poolKey, ModifyLiquidityParams(tickMin, tickMax, 1e22, bytes32(uint256(1))), ZERO_BYTES
+        );
+        modifyLiquidityRouter.modifyLiquidity(
+            poolKey, ModifyLiquidityParams(-199_800, -198_590, 1e21, bytes32(uint256(2))), ZERO_BYTES
+        );
+    }
+
+    function test_valueAt_equalsRealFullRangePosition() public {
+        _assertIdentity(30_000e6, 0xC0FFEE, 6, true);
+    }
+
+    function testFuzz_valueAt_equalsRealFullRangePosition(
+        uint256 navStart,
+        uint256 seed,
+        uint8 swaps,
+        bool withDonation
+    ) public {
+        _assertIdentity(bound(navStart, 1e6, 1e13), seed, bound(swaps, 1, 8), withDonation);
+    }
+
+    function _assertIdentity(uint256 navStart, uint256 seed, uint256 swaps, bool withDonation) internal {
+        PoolId id = poolKey.toId();
+        (int24 tickMin, int24 tickMax) = _fullRange();
+
+        // Epoch start: create the benchmark at the pool price and record global fee growth.
+        (uint160 sqrtStart,,,) = manager.getSlot0(id);
+        IOathVault.Benchmark memory b;
+        (b.L, b.r0, b.r1) = BenchmarkLib.create(navStart, sqrtStart, TICK_SPACING);
+        (b.G0, b.G1) = manager.getFeeGrowthGlobals(id);
+
+        // The real twin: the same liquidity full range. The pool charges exactly create's costs.
+        int256 l = int256(uint256(b.L));
+        BalanceDelta paid = modifyLiquidityNoChecks.modifyLiquidity(
+            poolKey, ModifyLiquidityParams(tickMin, tickMax, l, BENCH_SALT), ZERO_BYTES
+        );
+        (uint256 x, uint256 y) = BenchmarkLib.split(navStart, sqrtStart);
+        _assertCostMatches(uint256(uint128(-paid.amount0())), b.r0, x);
+        _assertCostMatches(uint256(uint128(-paid.amount1())), b.r1, y);
+
+        // The epoch: random swaps within ±2,000 ticks, optionally a donation.
+        for (uint256 i = 0; i < swaps; i++) {
+            int24 offset = int24(int256(uint256(keccak256(abi.encode(seed, i))) % 4_001) - 2_000);
+            _moveTo(poolKey, TickMath.getSqrtPriceAtTick(START_TICK + offset));
+            if (withDonation && i == 0) donateRouter.donate(poolKey, 1e18, 2_000e6, ZERO_BYTES);
+        }
+
+        // Epoch end: value the benchmark from two reads, then withdraw the real twin.
+        (uint160 sqrtEnd,,,) = manager.getSlot0(id);
+        (uint256 g0End, uint256 g1End) = manager.getFeeGrowthGlobals(id);
+        (uint256 benchValue, uint256 f0, uint256 f1) = BenchmarkLib.valueAt(b, g0End, g1End, sqrtEnd, TICK_SPACING);
+        assertGt(f0 + f1, 0, "fees earned");
+
+        BalanceDelta out = modifyLiquidityNoChecks.modifyLiquidity(
+            poolKey, ModifyLiquidityParams(tickMin, tickMax, -l, BENCH_SALT), ZERO_BYTES
+        );
+        (uint256 p0, uint256 p1) = ValuationLib.principal(b.L, tickMin, tickMax, sqrtEnd);
+        uint256 out0 = uint256(uint128(out.amount0()));
+        uint256 out1 = uint256(uint128(out.amount1()));
+        assertEq(out0, p0 + f0, "currency0: principal + fees, to the wei");
+        assertEq(out1, p1 + f1, "currency1: principal + fees, to the wei");
+        assertEq(benchValue, ValuationLib.value(out0 + b.r0, out1 + b.r1, sqrtEnd), "B_E = real position + leftovers");
+    }
+
+    /// @dev If the pool charged no more than the split, the leftover is exactly the rest of the split.
+    function _assertCostMatches(uint256 charged, uint256 leftover, uint256 available) internal pure {
+        if (charged <= available) assertEq(charged + leftover, available, "leftover = split - real cost");
+        else assertEq(leftover, 0, "no leftover when cost exceeds split");
     }
 }
