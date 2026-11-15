@@ -170,6 +170,49 @@ contract OathHookOracleTest is OathTestBase {
         assertEq(hook.cumulativeNow(key), int256(START_TICK) * 500);
     }
 
+    // ---------------------------------------------------------------- block-start tick
+
+    /// @dev The first swap of a block records the tick before it moves the price; later swaps in the same
+    ///      block leave the record alone; the next block's first swap records afresh.
+    function test_oracle_firstSwapOfBlockRecordsStartTick() public {
+        _createPool(START_TICK);
+        _nextBlock(12);
+        uint256 blockA = _block();
+
+        _moveToTick(START_TICK + 200);
+        _assertBlockStart(blockA, START_TICK);
+        _moveToTick(START_TICK + 500);
+        _moveToTick(START_TICK - 300);
+        _assertBlockStart(blockA, START_TICK);
+
+        _nextBlock(12);
+        int24 startOfB = _tick();
+        _moveToTick(START_TICK + 40);
+        _assertBlockStart(blockA + 1, startOfB);
+    }
+
+    /// @dev A swap in the pool's creation block records the creation tick.
+    function test_oracle_swapInCreationBlockRecordsCreationTick() public {
+        _createPool(START_TICK);
+        _moveToTick(START_TICK + 77);
+        _assertBlockStart(_block(), START_TICK);
+    }
+
+    /// @dev Only swaps move the price, so only swaps touch the block-start record.
+    function test_oracle_onlySwapsTrackBlockStart() public {
+        _createPool(START_TICK);
+        _moveToTick(START_TICK + 10);
+        uint256 swapBlock = _block();
+
+        _nextBlock(12);
+        hook.poke(key);
+        donateRouter.donate(key, 1e9, 1e9, ZERO_BYTES);
+        modifyLiquidityRouter.modifyLiquidity(key, LIQUIDITY_PARAMS, ZERO_BYTES);
+        vm.prank(vault);
+        hook.openEpoch(key, uint32(_time() + 7 days), 30 minutes);
+        _assertBlockStart(swapBlock, START_TICK);
+    }
+
     // ---------------------------------------------------------------- helpers
 
     /// @dev Registers the vault, creates the pool through the factory at `tick`, and adds deep full-range
@@ -226,5 +269,11 @@ contract OathHookOracleTest is OathTestBase {
         (uint32 ts,,, int256 cum) = hook.oracles(id);
         assertEq(cum, tickCumulative, "tickCumulative");
         assertEq(ts, lastTimestamp, "lastTimestamp");
+    }
+
+    function _assertBlockStart(uint256 blockNumber, int24 tick) internal view {
+        (, uint64 lastSwapBlock, int24 blockStartTick,) = hook.oracles(id);
+        assertEq(lastSwapBlock, blockNumber, "lastSwapBlock");
+        assertEq(blockStartTick, tick, "blockStartTick");
     }
 }

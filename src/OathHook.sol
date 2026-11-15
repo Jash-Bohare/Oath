@@ -165,13 +165,21 @@ contract OathHook is BaseHook, IOathHook {
     }
 
     /// @dev Observes swaps without changing them: no delta, no fee override. Runs before the price moves, so
-    ///      the accumulator is advanced with the tick that held since the last update (MATH.md §4).
+    ///      the accumulator is advanced with the tick that held since the last update (MATH.md §4). The first
+    ///      swap of each block also records the tick the block started at, which the guard on the vault's
+    ///      liquidity changes compares against.
     function _beforeSwap(address, PoolKey calldata key, SwapParams calldata, bytes calldata)
         internal
         override
         returns (bytes4, BeforeSwapDelta, uint24)
     {
-        _advance(key);
+        (PoolId id, int24 tick) = _advance(key);
+        IOathHook.Oracle storage o = oracles[id];
+        if (o.lastSwapBlock != block.number) {
+            o.blockStartTick = tick;
+            // forge-lint: disable-next-line(unsafe-typecast)
+            o.lastSwapBlock = uint64(block.number); // a block number never reaches 2^64
+        }
         return (IHooks.beforeSwap.selector, BeforeSwapDeltaLibrary.ZERO_DELTA, 0);
     }
 
