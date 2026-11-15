@@ -97,6 +97,8 @@ interface IOathHook {
     error PriceMovedThisBlock(int24 current, int24 blockStart);
     /// @notice `registerVault` called with a pool key whose `hooks` is not this hook.
     error WrongHook();
+    /// @notice `registerVault` called with the zero address as the vault.
+    error ZeroVault();
 
     /// @notice The only address allowed to register vaults and initialize pools with this hook.
     function factory() external view returns (address);
@@ -114,7 +116,8 @@ interface IOathHook {
         returns (address vault, int24 maxIntraBlockTicks, int24 vaultLower, int24 vaultUpper);
 
     /// @notice Registers the single vault of a pool. Factory only, once per pool id.
-    /// @dev Reverts `OnlyFactory()`, `WrongHook()` if `key.hooks != this`, `AlreadyRegistered()`.
+    /// @dev Reverts, in this order: `OnlyFactory()`; `WrongHook()` if `key.hooks != this`; `ZeroVault()` if
+    ///      `vault == address(0)`; `AlreadyRegistered()`. Parameter bounds are the factory's job.
     /// @param key The pool key; `key.hooks` must be this hook.
     /// @param vault The vault allowed to call `openEpoch`/`closeEpoch` and subject to the guard.
     /// @param maxIntraBlockTicks Guard threshold for the vault's liquidity changes.
