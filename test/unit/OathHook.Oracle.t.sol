@@ -5,7 +5,8 @@ import {IPoolManager} from "@uniswap/v4-core/src/interfaces/IPoolManager.sol";
 import {StateLibrary} from "@uniswap/v4-core/src/libraries/StateLibrary.sol";
 import {TickMath} from "@uniswap/v4-core/src/libraries/TickMath.sol";
 import {PoolId} from "@uniswap/v4-core/src/types/PoolId.sol";
-import {ModifyLiquidityParams} from "@uniswap/v4-core/src/types/PoolOperation.sol";
+import {IHooks} from "@uniswap/v4-core/src/interfaces/IHooks.sol";
+import {ModifyLiquidityParams, SwapParams} from "@uniswap/v4-core/src/types/PoolOperation.sol";
 import {OathHook} from "../../src/OathHook.sol";
 import {OathTestBase} from "../utils/OathTestBase.sol";
 
@@ -342,5 +343,79 @@ contract OathHookOracleTest is OathTestBase {
         (, uint64 lastSwapBlock, int24 blockStartTick,) = hook.oracles(id);
         assertEq(lastSwapBlock, blockNumber, "lastSwapBlock");
         assertEq(blockStartTick, tick, "blockStartTick");
+    }
+}
+
+/// @notice `beforeSwap` gas on a pool in steady state: created, swapped and advanced in earlier transactions
+///         (`setUp`), so the oracle's slots already hold non-zero values, as on a live pool.
+/// @dev These tests turn test isolation off, so each test is one transaction: with isolation every top-level
+///      call would be a separate transaction, always cold and including the 21,000 transaction base cost.
+contract OathHookSwapGasTest is OathTestBase {
+    address internal factory = makeAddr("factory");
+
+    OathHook internal hook;
+    PoolId internal id;
+
+    function setUp() public override {
+        super.setUp();
+        hook = OathHook(address(_deployOathHook(factory)));
+        key = _oathKey(currency0, currency1);
+        id = key.toId();
+        vm.prank(factory);
+        hook.registerVault(key, makeAddr("vault"), 50);
+        vm.prank(factory);
+        manager.initialize(key, TickMath.getSqrtPriceAtTick(-199196));
+        (int24 tickMin, int24 tickMax) = _fullRange();
+        modifyLiquidityRouter.modifyLiquidity(
+            key, ModifyLiquidityParams({tickLower: tickMin, tickUpper: tickMax, liquidityDelta: 1e24, salt: 0}), ""
+        );
+        vm.roll(vm.getBlockNumber() + 1);
+        vm.warp(vm.getBlockTimestamp() + 60);
+        _moveTo(key, TickMath.getSqrtPriceAtTick(-199100));
+        // The tests run in the next block.
+        vm.roll(vm.getBlockNumber() + 1);
+        vm.warp(vm.getBlockTimestamp() + 12);
+    }
+
+    /// @dev Bound: at most 15,000 gas warm in steady state with no checkpoint due, both for the first swap of a
+    ///      block (which also records the block-start tick) and for a later swap in the same block. Slots are
+    ///      warmed by reads only, so their original values are the steady-state ones.
+    /// forge-config: default.isolate = false
+    function test_gas_beforeSwapWarmSteadyState() public {
+        hook.oracles(id);
+        hook.cumulativeNow(key);
+
+        uint256 firstOfBlock = _beforeSwapGas();
+        uint256 sameBlock = _beforeSwapGas();
+        emit log_named_uint("beforeSwap gas, warm, first swap of block", firstOfBlock);
+        emit log_named_uint("beforeSwap gas, warm, same block", sameBlock);
+        assertLe(firstOfBlock, 15_000, "first swap of block");
+        assertLe(sameBlock, 15_000, "same block");
+    }
+
+    /// @dev Reported, not bounded: the first `beforeSwap` of a transaction pays cold account and storage access.
+    /// forge-config: default.isolate = false
+    function test_gas_beforeSwapColdReport() public {
+        emit log_named_uint("beforeSwap gas, cold, first swap of block", _beforeSwapGas());
+    }
+
+    /// @dev Gas of one `beforeSwap` call made as the PoolManager makes it, from pre-encoded calldata. Includes the
+    ///      `CALL` itself, so it slightly overstates the hook's own cost.
+    function _beforeSwapGas() internal returns (uint256 used) {
+        bytes memory data = abi.encodeCall(
+            IHooks.beforeSwap,
+            (
+                address(swapRouter),
+                key,
+                SwapParams({zeroForOne: true, amountSpecified: -1e6, sqrtPriceLimitX96: 0}),
+                ZERO_BYTES
+            )
+        );
+        address target = address(hook);
+        vm.prank(address(manager));
+        used = gasleft();
+        (bool ok,) = target.call(data);
+        used -= gasleft();
+        assertTrue(ok, "beforeSwap succeeded");
     }
 }
