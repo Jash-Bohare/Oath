@@ -9,6 +9,7 @@ import {IPoolManager} from "@uniswap/v4-core/src/interfaces/IPoolManager.sol";
 import {IHooks} from "@uniswap/v4-core/src/interfaces/IHooks.sol";
 import {StateLibrary} from "@uniswap/v4-core/src/libraries/StateLibrary.sol";
 import {PoolKey} from "@uniswap/v4-core/src/types/PoolKey.sol";
+import {PoolId} from "@uniswap/v4-core/src/types/PoolId.sol";
 import {BalanceDelta} from "@uniswap/v4-core/src/types/BalanceDelta.sol";
 import {SwapParams, ModifyLiquidityParams} from "@uniswap/v4-core/src/types/PoolOperation.sol";
 import {PoolSwapTest} from "@uniswap/v4-core/src/test/PoolSwapTest.sol";
@@ -133,6 +134,38 @@ contract ValuationLibTest is Test {
         assertLe(up0 - a0, 1);
         assertLe(up1 - a1, 1);
     }
+
+    // ---------------------------------------------------------------- fees and NAV (02_MATH §7)
+
+    function test_feesOwed_basic() public pure {
+        // 1 unit of growth per liquidity (2^128) over L = 1e16 owes exactly 1e16.
+        assertEq(ValuationLib.feesOwed(1e16, 0, 1 << 128), 1e16);
+        assertEq(ValuationLib.feesOwed(1e16, 5, 5), 0);
+    }
+
+    /// @dev Fee growth may wrap past 2^256; the unchecked difference still gives the true growth.
+    function testFuzz_feesOwed_wrapsLikeV4(uint128 liquidity, uint256 last, uint128 growth) public pure {
+        uint256 mark;
+        unchecked {
+            mark = last + growth;
+        }
+        assertEq(ValuationLib.feesOwed(liquidity, last, mark), ValuationLib.feesOwed(liquidity, 0, growth));
+    }
+
+    function test_feesOwed_wrapExample() public pure {
+        assertEq(ValuationLib.feesOwed(1 << 64, type(uint256).max - 5, 10), 16 * (1 << 64) >> 128);
+        assertEq(ValuationLib.feesOwed(1 << 127, type(uint256).max, 1), 1);
+    }
+
+    /// @dev With no position, NAV is just the idle tokens' value.
+    function test_nav_idleOnly() public pure {
+        ValuationLib.Position memory none;
+        uint160 sqrtP = TickMath.getSqrtPriceAtTick(-199196);
+        (uint256 navValue, uint256 f0, uint256 f1) = ValuationLib.nav(1e18, 500e6, none, sqrtP);
+        assertEq(navValue, ValuationLib.value(1e18, 500e6, sqrtP));
+        assertEq(f0, 0);
+        assertEq(f1, 0);
+    }
 }
 
 /// @notice ValuationLib against the real PoolManager (07_TEST_PLAN §2): `principal` equals the amounts a
@@ -204,14 +237,61 @@ contract ValuationLibPoolTest is OathTestBase {
         assertEq(poolSqrtP, sqrtP, "pool at target price");
 
         int256 l = int256(uint256(liquidity));
-        modifyLiquidityRouter.modifyLiquidity(poolKey, ModifyLiquidityParams(tA, tB, l, POSITION_SALT), ZERO_BYTES);
-        BalanceDelta out = modifyLiquidityRouter.modifyLiquidity(
+        modifyLiquidityNoChecks.modifyLiquidity(poolKey, ModifyLiquidityParams(tA, tB, l, POSITION_SALT), ZERO_BYTES);
+        BalanceDelta out = modifyLiquidityNoChecks.modifyLiquidity(
             poolKey, ModifyLiquidityParams(tA, tB, -l, POSITION_SALT), ZERO_BYTES
         );
 
         (uint256 p0, uint256 p1) = ValuationLib.principal(liquidity, tA, tB, poolSqrtP);
         assertEq(int256(out.amount0()), int256(p0), "amount0 to the wei");
         assertEq(int256(out.amount1()), int256(p1), "amount1 to the wei");
+    }
+
+    /// @dev NAV with uncollected fees (02_MATH §7): after swaps through the position, principal plus
+    ///      `feesOwed` (fee growth inside since the last collection) equals what a real withdrawal pays.
+    function test_nav_feesAndPrincipalEqualWithdrawal() public {
+        _assertNavEqualsWithdrawal(-199400, -199000, 1e17, 4);
+    }
+
+    function testFuzz_nav_feesAndPrincipalEqualWithdrawal(uint128 liquidity, int24 lower, int24 width, uint8 swaps)
+        public
+    {
+        // Down to L = 1e14 (the 02_MATH §9.1 curator position is ~3.1e16): smaller positions earn < 1 wei of
+        // currency1 fees per crossing, which v4 correctly rounds to 0, so "earned fees" would not be testable.
+        liquidity = uint128(bound(liquidity, 1e14, 1e20));
+        int24 tA = int24(bound(lower, -200_000, -198_400)) / TICK_SPACING * TICK_SPACING;
+        int24 tB = tA + int24(bound(width, 1, 200)) * TICK_SPACING;
+        _assertNavEqualsWithdrawal(tA, tB, liquidity, bound(swaps, 2, 8));
+    }
+
+    /// @dev Adds a position, swaps back and forth across it (alternately to start − 1,500 and start + 3,500
+    ///      ticks, which crosses every range the tests use), then compares `nav` with a real withdrawal.
+    function _assertNavEqualsWithdrawal(int24 tA, int24 tB, uint128 liquidity, uint256 swaps) internal {
+        int256 l = int256(uint256(liquidity));
+        modifyLiquidityNoChecks.modifyLiquidity(poolKey, ModifyLiquidityParams(tA, tB, l, POSITION_SALT), ZERO_BYTES);
+        for (uint256 i = 0; i < swaps; i++) {
+            _moveTo(TickMath.getSqrtPriceAtTick(START_TICK + (i % 2 == 0 ? int24(-1_500) : int24(3_500))));
+        }
+        (uint160 sqrtP,,,) = manager.getSlot0(poolKey.toId());
+
+        PoolId id = poolKey.toId();
+        ValuationLib.Position memory pos;
+        pos.liquidity = liquidity;
+        pos.tickLower = tA;
+        pos.tickUpper = tB;
+        (, pos.feeGrowthInside0Last, pos.feeGrowthInside1Last) =
+            manager.getPositionInfo(id, address(modifyLiquidityNoChecks), tA, tB, POSITION_SALT);
+        (pos.feeGrowthInside0Mark, pos.feeGrowthInside1Mark) = manager.getFeeGrowthInside(id, tA, tB);
+        (uint256 navValue, uint256 f0, uint256 f1) = ValuationLib.nav(0, 0, pos, sqrtP);
+        assertGt(f0 + f1, 0, "swaps earned fees");
+
+        BalanceDelta out = modifyLiquidityNoChecks.modifyLiquidity(
+            poolKey, ModifyLiquidityParams(tA, tB, -l, POSITION_SALT), ZERO_BYTES
+        );
+        (uint256 p0, uint256 p1) = ValuationLib.principal(liquidity, tA, tB, sqrtP);
+        assertEq(int256(out.amount0()), int256(p0 + f0), "amount0 = principal0 + fees0, to the wei");
+        assertEq(int256(out.amount1()), int256(p1 + f1), "amount1 = principal1 + fees1, to the wei");
+        assertEq(navValue, ValuationLib.value(uint128(out.amount0()), uint128(out.amount1()), sqrtP), "nav");
     }
 
     /// @dev Swaps exact-input against the background liquidity until the price is exactly `target`.
