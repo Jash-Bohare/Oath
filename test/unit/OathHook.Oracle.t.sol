@@ -39,7 +39,7 @@ contract OathHookOracleTest is OathTestBase {
         _assertOracle(0, createdAt);
         assertEq(hook.cumulativeNow(key), 0, "zero at creation");
 
-        vm.warp(block.timestamp + 100);
+        _wait(100);
         assertEq(hook.cumulativeNow(key), int256(START_TICK) * 100, "start tick held for 100 s");
         _assertOracle(0, createdAt); // a view never writes
     }
@@ -49,12 +49,12 @@ contract OathHookOracleTest is OathTestBase {
     function test_oracle_pokeBeforeInitializeIsHarmless() public {
         vm.prank(factory);
         hook.registerVault(key, vault, 50);
-        vm.warp(block.timestamp + 1_000);
+        _wait(1_000);
         hook.poke(key);
 
-        vm.warp(block.timestamp + 1_000);
+        _wait(1_000);
         _initializeAt(START_TICK);
-        vm.warp(block.timestamp + 60);
+        _wait(60);
         assertEq(hook.cumulativeNow(key), int256(START_TICK) * 60);
     }
 
@@ -64,27 +64,27 @@ contract OathHookOracleTest is OathTestBase {
     ///      counts only from now on.
     function test_oracle_swapAdvancesWithTickBeforeSwap() public {
         _createPool(START_TICK);
-        vm.warp(block.timestamp + 100);
+        _wait(100);
         _moveToTick(START_TICK + 1_234);
         int24 t1 = _tick();
         assertTrue(t1 != START_TICK, "price moved");
         _assertOracle(int256(START_TICK) * 100, createdAt + 100);
 
-        vm.warp(block.timestamp + 50);
+        _wait(50);
         assertEq(hook.cumulativeNow(key), int256(START_TICK) * 100 + int256(t1) * 50);
     }
 
     /// @dev Swaps in the same block add nothing; only the tick left by the block's last swap counts afterwards.
     function test_oracle_sameBlockSwapsAddNothing() public {
         _createPool(START_TICK);
-        vm.warp(block.timestamp + 100);
+        _wait(100);
         _moveToTick(START_TICK - 500);
         _moveToTick(START_TICK + 700);
         _moveToTick(START_TICK + 300);
         int24 last = _tick();
         _assertOracle(int256(START_TICK) * 100, createdAt + 100);
 
-        vm.warp(block.timestamp + 10);
+        _wait(10);
         assertEq(hook.cumulativeNow(key), int256(START_TICK) * 100 + int256(last) * 10);
     }
 
@@ -96,13 +96,13 @@ contract OathHookOracleTest is OathTestBase {
         uint32[4] memory waits = [uint32(1), 7 days, 13, 3_600];
         for (uint256 i; i < 4; i++) {
             expected += int256(_tick()) * int256(uint256(waits[i]));
-            vm.warp(block.timestamp + waits[i]);
-            vm.roll(block.number + 1);
+            _wait(waits[i]);
+            vm.roll(_block() + 1);
             _moveToTick(targets[i]);
             assertEq(hook.cumulativeNow(key), expected, "after swap");
         }
         expected += int256(_tick()) * 77;
-        vm.warp(block.timestamp + 77);
+        _wait(77);
         assertEq(hook.cumulativeNow(key), expected, "end");
     }
 
@@ -110,27 +110,27 @@ contract OathHookOracleTest is OathTestBase {
 
     function test_oracle_pokeAdvances() public {
         _createPool(START_TICK);
-        vm.warp(block.timestamp + 321);
+        _wait(321);
         int256 before = hook.cumulativeNow(key);
         vm.prank(alice);
         hook.poke(key);
-        _assertOracle(before, uint32(block.timestamp));
+        _assertOracle(before, uint32(_time()));
         assertEq(hook.cumulativeNow(key), before, "nothing double-counted");
     }
 
     function test_oracle_donateAdvances() public {
         _createPool(START_TICK);
-        vm.warp(block.timestamp + 321);
+        _wait(321);
         int256 before = hook.cumulativeNow(key);
         donateRouter.donate(key, 1e9, 1e9, ZERO_BYTES);
-        _assertOracle(before, uint32(block.timestamp));
+        _assertOracle(before, uint32(_time()));
     }
 
     /// @dev From the same state, a poke, a donation and a swap leave the accumulator identical: the swap
     ///      advances before it moves the price.
     function test_oracle_pokeDonateAndSwapPathsAgree() public {
         _createPool(START_TICK);
-        vm.warp(block.timestamp + 1 hours);
+        _wait(1 hours);
         uint256 snap = vm.snapshotState();
 
         hook.poke(key);
@@ -154,16 +154,16 @@ contract OathHookOracleTest is OathTestBase {
     /// @dev The vault advances the accumulator when it opens an epoch.
     function test_oracle_openEpochAdvances() public {
         _createPool(START_TICK);
-        vm.warp(block.timestamp + 45 minutes);
+        _wait(45 minutes);
         vm.prank(vault);
-        hook.openEpoch(key, uint32(block.timestamp + 7 days), 30 minutes);
-        _assertOracle(int256(START_TICK) * 45 minutes, uint32(block.timestamp));
+        hook.openEpoch(key, uint32(_time() + 7 days), 30 minutes);
+        _assertOracle(int256(START_TICK) * 45 minutes, uint32(_time()));
     }
 
     /// @dev Liquidity changes cannot move the tick, so they leave the accumulator alone and it stays exact.
     function test_oracle_liquidityChangesDoNotAdvance() public {
         _createPool(START_TICK);
-        vm.warp(block.timestamp + 500);
+        _wait(500);
         modifyLiquidityRouter.modifyLiquidity(key, LIQUIDITY_PARAMS, ZERO_BYTES);
         modifyLiquidityRouter.modifyLiquidity(key, REMOVE_LIQUIDITY_PARAMS, ZERO_BYTES);
         _assertOracle(0, createdAt);
@@ -188,10 +188,29 @@ contract OathHookOracleTest is OathTestBase {
         );
     }
 
+    /// @dev Live block values. Under via_ir the optimizer may treat `block.timestamp` and `block.number` as
+    ///      constant within the test's transaction, so after `vm.warp`/`vm.roll` read them through the cheatcodes.
+    function _time() internal view returns (uint256) {
+        return vm.getBlockTimestamp();
+    }
+
+    function _block() internal view returns (uint256) {
+        return vm.getBlockNumber();
+    }
+
+    function _wait(uint256 dt) internal {
+        vm.warp(_time() + dt);
+    }
+
+    function _nextBlock(uint256 dt) internal {
+        vm.roll(_block() + 1);
+        vm.warp(_time() + dt);
+    }
+
     function _initializeAt(int24 tick) internal {
         vm.prank(factory);
         manager.initialize(key, TickMath.getSqrtPriceAtTick(tick));
-        createdAt = uint32(block.timestamp);
+        createdAt = uint32(_time());
         assertEq(_tick(), tick, "created at tick");
     }
 
