@@ -196,8 +196,18 @@ contract BenchmarkLibPoolTest is OathTestBase {
         );
     }
 
+    /// @dev The §9.1 vault size earns fees in both currencies, so the identity is exercised on real fees.
     function test_valueAt_equalsRealFullRangePosition() public {
-        _assertIdentity(30_000e6, 0xC0FFEE, 6, true);
+        (uint256 f0, uint256 f1) = _assertIdentity(30_000e6, 0xC0FFEE, 6, true);
+        assertGt(f0, 0, "currency0 fees earned");
+        assertGt(f1, 0, "currency1 fees earned");
+    }
+
+    /// @dev Same, from swap fees alone.
+    function test_valueAt_equalsRealFullRangePositionSwapFeesOnly() public {
+        (uint256 f0, uint256 f1) = _assertIdentity(30_000e6, 0xC0FFEE, 6, false);
+        assertGt(f0, 0, "currency0 fees earned");
+        assertGt(f1, 0, "currency1 fees earned");
     }
 
     function testFuzz_valueAt_equalsRealFullRangePosition(
@@ -206,10 +216,17 @@ contract BenchmarkLibPoolTest is OathTestBase {
         uint8 swaps,
         bool withDonation
     ) public {
+        // Every size down to $1: a dust-sized benchmark may earn fees that floor to 0 wei, and the identity
+        // must still hold to the wei. That fees are really exercised is asserted by the fixed tests above.
         _assertIdentity(bound(navStart, 1e6, 1e13), seed, bound(swaps, 1, 8), withDonation);
     }
 
-    function _assertIdentity(uint256 navStart, uint256 seed, uint256 swaps, bool withDonation) internal {
+    /// @return f0 Benchmark fees in currency0 over the epoch.
+    /// @return f1 Benchmark fees in currency1 over the epoch.
+    function _assertIdentity(uint256 navStart, uint256 seed, uint256 swaps, bool withDonation)
+        internal
+        returns (uint256 f0, uint256 f1)
+    {
         PoolId id = poolKey.toId();
         (int24 tickMin, int24 tickMax) = _fullRange();
 
@@ -238,8 +255,8 @@ contract BenchmarkLibPoolTest is OathTestBase {
         // Epoch end: value the benchmark from two reads, then withdraw the real twin.
         (uint160 sqrtEnd,,,) = manager.getSlot0(id);
         (uint256 g0End, uint256 g1End) = manager.getFeeGrowthGlobals(id);
-        (uint256 benchValue, uint256 f0, uint256 f1) = BenchmarkLib.valueAt(b, g0End, g1End, sqrtEnd, TICK_SPACING);
-        assertGt(f0 + f1, 0, "fees earned");
+        uint256 benchValue;
+        (benchValue, f0, f1) = BenchmarkLib.valueAt(b, g0End, g1End, sqrtEnd, TICK_SPACING);
 
         BalanceDelta out = modifyLiquidityNoChecks.modifyLiquidity(
             poolKey, ModifyLiquidityParams(tickMin, tickMax, -l, BENCH_SALT), ZERO_BYTES
