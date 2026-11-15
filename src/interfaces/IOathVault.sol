@@ -11,15 +11,15 @@ import {IOathHook} from "./IOathHook.sol";
 ///         currency1 bond and manages one concentrated position. Every epoch the vault is settled against an
 ///         exact on-chain counterfactual (a passive full-range position of the same start value): the curator
 ///         earns a performance fee on outperformance beyond the band, or the bond pays depositors the
-///         shortfall beyond the band. All values are in raw currency1 units (02_MATH §1).
+///         shortfall beyond the band. All values are in raw currency1 units (MATH.md §1).
 interface IOathVault {
-    /// @notice Vault lifecycle (01_ARCHITECTURE §3). SETTLEABLE is derived: `ACTIVE && now ≥ epochEnd`.
+    /// @notice Vault lifecycle. SETTLEABLE is derived: `ACTIVE && now ≥ epochEnd`.
     enum State {
         OPEN,
         ACTIVE
     }
 
-    /// @notice Per-vault parameters, fixed at creation and validated by the factory (01_ARCHITECTURE §6).
+    /// @notice Per-vault parameters, fixed at creation and validated by the factory (MATH.md §12).
     /// @param epochDuration Epoch length `E − S` (seconds). Default 7 days, demo 1 day.
     /// @param twapWindow End-of-epoch TWAP window `W` and minimum open window (seconds). Default 30 min.
     /// @param maxOpen Maximum open window before `startEpoch` (seconds). Default 6 h.
@@ -41,7 +41,7 @@ interface IOathVault {
         uint16 capBps;
     }
 
-    /// @notice Optional swap executed inside a reposition (04_VAULT_SPEC §4).
+    /// @notice Optional swap executed inside a reposition.
     /// @param zeroForOne Swap direction.
     /// @param amountSpecified `0` for no swap; otherwise must be `< 0` (exact input).
     /// @param sqrtPriceLimitX96 Price limit for the swap.
@@ -51,7 +51,7 @@ interface IOathVault {
         uint160 sqrtPriceLimitX96;
     }
 
-    /// @notice The epoch's hypothetical full-range benchmark (02_MATH §6.1).
+    /// @notice The epoch's hypothetical full-range benchmark (MATH.md §6.1).
     /// @param L Benchmark liquidity `L_b`.
     /// @param r0 Leftover currency0 held outside the pool.
     /// @param r1 Leftover currency1 held outside the pool.
@@ -61,7 +61,7 @@ interface IOathVault {
     /// @param startTick Start TWAP tick over the open window.
     struct Benchmark {
         // forge-lint: disable-next-line(mixed-case-variable)
-        uint128 L; // 02_MATH notation
+        uint128 L; // MATH.md notation
         uint256 r0;
         uint256 r1;
         // forge-lint: disable-next-line(mixed-case-variable)
@@ -72,7 +72,7 @@ interface IOathVault {
         int24 startTick;
     }
 
-    /// @notice The stored outcome of one settled epoch (05_SETTLEMENT_SPEC §4). Every number the frontend
+    /// @notice The stored outcome of one settled epoch. Every number the frontend
     ///         and the demo show comes from these fields.
     /// @param start Epoch start `S`.
     /// @param end Epoch end `E`.
@@ -134,10 +134,10 @@ interface IOathVault {
     );
     /// @notice Emitted when the curator moves the position during an epoch.
     event Rebalanced(int24 tickLower, int24 tickUpper, uint128 liquidity);
-    /// @notice Emitted when an epoch is settled (05_SETTLEMENT_SPEC §4).
+    /// @notice Emitted when an epoch is settled.
     event Settled(uint256 indexed epoch, EpochResult result);
     /// @notice Emitted when the shortfall beyond the band exceeds the bond; the uncovered part stays with
-    ///         depositors (05_SETTLEMENT_SPEC §2).
+    ///         depositors (MATH.md §9.2).
     event BondExhausted(uint256 shortfallUncovered);
 
     /// @notice Action requires the OPEN state.
@@ -234,7 +234,7 @@ interface IOathVault {
     /// @notice Whether `settle` may be called: `state == ACTIVE && now ≥ epochEnd`.
     function isSettleable() external view returns (bool);
 
-    /// @notice Deposits in kind during the open window (04_VAULT_SPEC §3.1, 02_MATH §11). Price-free: the
+    /// @notice Deposits in kind during the open window (MATH.md §11). Price-free: the
     ///         first deposit mints `sqrt(a0·a1) − MIN_SHARES` (MIN_SHARES to 0xdead); later deposits mint
     ///         `min_i(supply·a_i/h_i)` and take `mulDivUp(h_i, shares, supply)`; unused amounts are not taken.
     /// @param amount0Max Maximum currency0 to deposit (must equal `msg.value` if currency0 is native).
@@ -250,7 +250,7 @@ interface IOathVault {
         returns (uint256 shares, uint256 used0, uint256 used1);
 
     /// @notice Burns shares for a pro-rata share of both idle tokens during the open window: `out_i =
-    ///         mulDiv(h_i, shares, supply)` (04_VAULT_SPEC §3.2, 02_MATH §11).
+    ///         mulDiv(h_i, shares, supply)` (MATH.md §11).
     /// @param shares Shares to burn from the caller.
     /// @param min0 Minimum currency0 out, else `Slippage()`.
     /// @param min1 Minimum currency1 out, else `Slippage()`.
@@ -261,41 +261,40 @@ interface IOathVault {
         external
         returns (uint256 out0, uint256 out1);
 
-    /// @notice Adds currency1 to the curator bond. Curator only, any state (04_VAULT_SPEC §3.3).
+    /// @notice Adds currency1 to the curator bond. Curator only, any state.
     /// @param amount Currency1 to pull from the curator.
     function postBond(uint256 amount) external;
 
-    /// @notice Withdraws currency1 from the bond. Curator only, OPEN only (04_VAULT_SPEC §3.4).
+    /// @notice Withdraws currency1 from the bond. Curator only, OPEN only.
     /// @param amount Currency1 to send to the curator.
     function withdrawBond(uint256 amount) external;
 
     /// @notice Restarts an open window that exceeded `maxOpen`: `T0 = now`, `cumAtOpen = cumulativeNow`.
-    ///         Anyone, OPEN only (04_VAULT_SPEC §3.5).
+    ///         Anyone, OPEN only.
     function refreshOpenWindow() external;
 
-    /// @notice Starts the first open window right after pool initialization. Factory only, once
-    ///         (04_VAULT_SPEC §3.6, 01_ARCHITECTURE §4.1).
+    /// @notice Starts the first open window right after pool initialization. Factory only, once.
     function initOpenWindow() external;
 
-    /// @notice Starts an epoch (04_VAULT_SPEC §4.1): marks the vault at the open-window TWAP, creates the
+    /// @notice Starts an epoch: marks the vault at the open-window TWAP, creates the
     ///         benchmark, checks the cap and the bond, schedules the hook checkpoints, and opens the position.
     /// @param tickLower Lower tick of the curator's range.
     /// @param tickUpper Upper tick of the curator's range.
     /// @param swap Optional exact-input swap before adding liquidity.
     function startEpoch(int24 tickLower, int24 tickUpper, SwapIntent calldata swap) external;
 
-    /// @notice Moves the position to a new range during an epoch, after the cooldown (04_VAULT_SPEC §4.2).
+    /// @notice Moves the position to a new range during an epoch, after the cooldown.
     /// @param tickLower New lower tick.
     /// @param tickUpper New upper tick.
     /// @param swap Optional exact-input swap between removing and adding liquidity.
     function rebalance(int24 tickLower, int24 tickUpper, SwapIntent calldata swap) external;
 
     /// @notice Settles the epoch against the benchmark at the end TWAP, applies the payout or fee, unwinds
-    ///         the position and reopens the window. Anyone, once `now ≥ epochEnd` (05_SETTLEMENT_SPEC §1).
+    ///         the position and reopens the window. Anyone, once `now ≥ epochEnd`.
     function settle() external;
 
     /// @notice Live mark of vault and benchmark at the current spot price with live fee growth. For display
-    ///         only ("live mark (spot)"); settlement uses TWAP (04_VAULT_SPEC §6).
+    ///         only ("live mark (spot)"); settlement uses TWAP.
     /// @return navNow Vault NAV at spot.
     /// @return benchNow Benchmark value at spot.
     /// @return diff `navNow − benchNow`.

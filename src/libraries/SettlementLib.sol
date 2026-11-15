@@ -5,7 +5,7 @@ import {FullMath} from "@uniswap/v4-core/src/libraries/FullMath.sol";
 import {SafeCast} from "@openzeppelin/contracts/utils/math/SafeCast.sol";
 
 /// @title SettlementLib
-/// @notice The Oath verdict (02_MATH §9, 05_SETTLEMENT_SPEC §2). Compares the vault's NAV with the benchmark
+/// @notice The Oath verdict (MATH.md §9). Compares the vault's NAV with the benchmark
 ///         at epoch end, both marked at the same TWAP price:
 ///         - shortfall beyond the band: the curator's bond pays depositors the excess shortfall, up to the bond;
 ///         - outperformance beyond the band: the curator earns `perfFeeBps` of the excess, as new shares;
@@ -17,7 +17,7 @@ library SettlementLib {
     /// @notice The benchmark is worth zero; impossible when the epoch started with a positive NAV.
     error ZeroBenchmark();
 
-    /// @notice Settles one epoch (02_MATH §9):
+    /// @notice Settles one epoch (MATH.md §9):
     ///         `d = NAV_E − B_E`, `band = mulDiv(B_E, bandBps, 10,000)`;
     ///         `d < −band` → `payout = min(−d − band, bond)`;
     ///         `d > band`  → `fee = mulDiv(d − band, perfFeeBps, 10,000)`;
@@ -58,7 +58,7 @@ library SettlementLib {
 
         if (fee != 0) {
             // fee ≤ (d − band)·perfFeeBps/10,000 ≤ d < NAV_E since B_E > 0 and perfFeeBps ≤ 10,000 (the factory
-            // caps it at 5,000). Asserted anyway (05_SETTLEMENT_SPEC §2).
+            // caps it at 5,000). Asserted anyway (MATH.md §9.2).
             assert(fee < navEnd);
             feeShares = FullMath.mulDiv(supply, fee, navEnd - fee);
         }

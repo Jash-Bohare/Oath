@@ -8,11 +8,11 @@ import {SqrtPriceMath} from "@uniswap/v4-core/src/libraries/SqrtPriceMath.sol";
 import {TickMath} from "@uniswap/v4-core/src/libraries/TickMath.sol";
 
 /// @title ValuationLib
-/// @notice Values token amounts, positions and the vault in currency1 units (the numeraire, 02_MATH §1).
+/// @notice Values token amounts, positions and the vault in currency1 units (the numeraire, MATH.md §1).
 ///         Every function is pure and mirrors how Uniswap v4 itself values a position, so a real withdrawal
 ///         at the same price returns exactly these amounts.
 library ValuationLib {
-    /// @notice A concentrated position and its fee-growth-inside marks (02_MATH §7).
+    /// @notice A concentrated position and its fee-growth-inside marks (MATH.md §7).
     /// @param liquidity Position liquidity `L`.
     /// @param tickLower Lower tick `tA`.
     /// @param tickUpper Upper tick `tB`.
@@ -31,7 +31,7 @@ library ValuationLib {
     }
 
     /// @notice Value of `a0` currency0 plus `a1` currency1 in currency1 units at `sqrtPriceX96`
-    ///         (02_MATH §2): `a1 + mulDiv(mulDiv(a0, sqrtP, Q96), sqrtP, Q96)`.
+    ///         (MATH.md §2): `a1 + mulDiv(mulDiv(a0, sqrtP, Q96), sqrtP, Q96)`.
     /// @dev Two mulDivs because `sqrtP²` can exceed 256 bits. Rounds down.
     /// @param a0 Amount of currency0 (raw units).
     /// @param a1 Amount of currency1 (raw units).
@@ -43,7 +43,7 @@ library ValuationLib {
     }
 
     /// @notice Token amounts of a position of liquidity `L` on `[tickLower, tickUpper)` at `sqrtPriceX96`
-    ///         (02_MATH §3). These are the amounts a withdrawal at that price returns, before fees.
+    ///         (MATH.md §3). These are the amounts a withdrawal at that price returns, before fees.
     /// @dev Rounds down, like v4 for a liquidity removal.
     ///      | `sP ≤ sA`      | amount0 = getAmount0Delta(sA, sB, L) | amount1 = 0                          |
     ///      | `sA < sP < sB` | amount0 = getAmount0Delta(sP, sB, L) | amount1 = getAmount1Delta(sA, sP, L) |
@@ -72,7 +72,7 @@ library ValuationLib {
         }
     }
 
-    /// @notice Fees owed to liquidity `L` between two fee-growth marks (02_MATH §7):
+    /// @notice Fees owed to liquidity `L` between two fee-growth marks (MATH.md §7):
     ///         `mulDiv(growthMark − growthLast, L, Q128)`.
     /// @dev The difference is `unchecked` because fee growth may wrap, exactly as in v4's `Position.sol`.
     /// @param liquidity Liquidity `L`.
@@ -87,7 +87,7 @@ library ValuationLib {
         return FullMath.mulDiv(delta, liquidity, FixedPoint128.Q128);
     }
 
-    /// @notice Vault NAV at a mark price (02_MATH §7): idle tokens plus the position's principal and
+    /// @notice Vault NAV at a mark price (MATH.md §7): idle tokens plus the position's principal and
     ///         uncollected fees, valued in currency1:
     ///         `value(idle0 + p0 + u0, idle1 + p1 + u1, sqrtP)`.
     /// @param idle0 Idle currency0 (vault balance).

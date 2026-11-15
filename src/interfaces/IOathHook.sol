@@ -10,7 +10,7 @@ import {PoolId} from "@uniswap/v4-core/src/types/PoolId.sol";
 ///         intra-block price manipulation, and only lets `OathFactory` create pools. It holds no funds and
 ///         never changes swap amounts or fees.
 interface IOathHook {
-    /// @notice Per-pool TWAP accumulator and block-start tracking (03_HOOK_SPEC §2, 02_MATH §4).
+    /// @notice Per-pool TWAP accumulator and block-start tracking (MATH.md §4).
     /// @param lastTimestamp Last time `tickCumulative` was advanced.
     /// @param lastSwapBlock Block number of the last `beforeSwap`.
     /// @param blockStartTick Tick before the first swap of `lastSwapBlock`.
@@ -22,7 +22,7 @@ interface IOathHook {
         int256 tickCumulative;
     }
 
-    /// @notice Per-pool epoch checkpoints and boundary snapshot (03_HOOK_SPEC §2, 02_MATH §5, §8).
+    /// @notice Per-pool epoch checkpoints and boundary snapshot (MATH.md §5, §8).
     /// @param checkpointA `E − W`, the start of the end-of-epoch TWAP window.
     /// @param checkpointB `E`, the epoch end.
     /// @param doneA Whether `cumA` has been recorded.
@@ -45,16 +45,16 @@ interface IOathHook {
         int256 cumA;
         int256 cumB;
         // forge-lint: disable-next-line(mixed-case-variable)
-        uint256 G0; // 02_MATH notation
+        uint256 G0; // MATH.md notation
         // forge-lint: disable-next-line(mixed-case-variable)
         uint256 G1;
         uint256 fgIn0;
         uint256 fgIn1;
     }
 
-    /// @notice Per-pool registration and vault range tracking (03_HOOK_SPEC §2).
+    /// @notice Per-pool registration and vault range tracking.
     /// @param vault The pool's single registered `OathVault`.
-    /// @param maxIntraBlockTicks Guard threshold for vault liquidity changes (03_HOOK_SPEC §4.6).
+    /// @param maxIntraBlockTicks Guard threshold for vault liquidity changes.
     /// @param vaultLower Lower tick of the last range the vault added liquidity to.
     /// @param vaultUpper Upper tick of the last range the vault added liquidity to.
     struct PoolConfig {
@@ -113,7 +113,7 @@ interface IOathHook {
         view
         returns (address vault, int24 maxIntraBlockTicks, int24 vaultLower, int24 vaultUpper);
 
-    /// @notice Registers the single vault of a pool. Factory only, once per pool id (03_HOOK_SPEC §5).
+    /// @notice Registers the single vault of a pool. Factory only, once per pool id.
     /// @dev Reverts `OnlyFactory()`, `WrongHook()` if `key.hooks != this`, `AlreadyRegistered()`.
     /// @param key The pool key; `key.hooks` must be this hook.
     /// @param vault The vault allowed to call `openEpoch`/`closeEpoch` and subject to the guard.
@@ -121,7 +121,7 @@ interface IOathHook {
     function registerVault(PoolKey calldata key, address vault, int24 maxIntraBlockTicks) external;
 
     /// @notice Opens an epoch ending at `epochEnd` and schedules checkpoints at `epochEnd − twapWindow` and
-    ///         `epochEnd`. Registered vault only (03_HOOK_SPEC §5).
+    ///         `epochEnd`. Registered vault only.
     /// @dev Advances the accumulator first. Reverts `OnlyVault()`, `EpochAlreadyActive()`, and `BadWindow()`
     ///      unless `epochEnd − twapWindow > now`.
     /// @param key The pool key.
@@ -129,18 +129,18 @@ interface IOathHook {
     /// @param twapWindow End-of-epoch TWAP window `W` (seconds).
     function openEpoch(PoolKey calldata key, uint32 epochEnd, uint32 twapWindow) external;
 
-    /// @notice Closes a settled epoch. Registered vault only, at the end of `settle` (03_HOOK_SPEC §5).
+    /// @notice Closes a settled epoch. Registered vault only, at the end of `settle`.
     /// @dev Reverts `OnlyVault()`, and `EpochNotReady()` unless `snapTaken && doneA && doneB`.
     /// @param key The pool key.
     function closeEpoch(PoolKey calldata key) external;
 
     /// @notice Advances the accumulator and records any due checkpoints and the boundary snapshot.
-    ///         Anyone may call (03_HOOK_SPEC §3).
+    ///         Anyone may call.
     /// @param key The pool key.
     function poke(PoolKey calldata key) external;
 
     /// @notice The tick cumulative at the current block time:
-    ///         `tickCumulative + tick·(now − lastTimestamp)` (02_MATH §4).
+    ///         `tickCumulative + tick·(now − lastTimestamp)` (MATH.md §4).
     /// @param key The pool key.
     /// @return The cumulative Σ tick·dt up to `block.timestamp`.
     function cumulativeNow(PoolKey calldata key) external view returns (int256);
