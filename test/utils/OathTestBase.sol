@@ -15,7 +15,7 @@ import {PoolSwapTest} from "@uniswap/v4-core/src/test/PoolSwapTest.sol";
 import {IOathHook} from "../../src/interfaces/IOathHook.sol";
 import {IOathVault} from "../../src/interfaces/IOathVault.sol";
 
-/// @notice The exact permission set of OathHook (03_HOOK_SPEC §1); everything else, including every
+/// @notice The exact permission set of OathHook; everything else, including every
 ///         `*ReturnsDelta` flag, is false.
 function oathPermissions() pure returns (Hooks.Permissions memory p) {
     p.beforeInitialize = true;
@@ -28,20 +28,20 @@ function oathPermissions() pure returns (Hooks.Permissions memory p) {
 /// @title OathTestBase
 /// @notice Shared setup for Oath tests: a real `PoolManager` with v4-core's test routers (via `Deployers`),
 ///         two sorted ERC-20 currencies, the flagged hook address, pool keys and the per-vault parameters.
-/// @dev The hook can only live at an address whose low 14 bits equal its permission flags (03_HOOK_SPEC §1),
+/// @dev The hook can only live at an address whose low 14 bits equal its permission flags,
 ///      so it is deployed with `deployCodeTo` at `HOOK_ADDRESS`.
 abstract contract OathTestBase is Deployers {
     using StateLibrary for IPoolManager;
 
     /// @notice OathHook permission flags: beforeInitialize | beforeAddLiquidity | beforeRemoveLiquidity |
-    ///         beforeSwap | beforeDonate = 0x2AA0 (03_HOOK_SPEC §1).
+    ///         beforeSwap | beforeDonate = 0x2AA0.
     uint160 internal constant HOOK_FLAGS = Hooks.BEFORE_INITIALIZE_FLAG | Hooks.BEFORE_ADD_LIQUIDITY_FLAG
         | Hooks.BEFORE_REMOVE_LIQUIDITY_FLAG | Hooks.BEFORE_SWAP_FLAG | Hooks.BEFORE_DONATE_FLAG;
 
     /// @notice Where tests deploy the hook: arbitrary high bits, low 14 bits exactly `HOOK_FLAGS`.
     address internal constant HOOK_ADDRESS = address(uint160(0x4f41544800000000000000000000000000000000) | HOOK_FLAGS);
 
-    /// @notice Demo pool shape: ETH/USDC, fee 500, tick spacing 10 (02_MATH §1).
+    /// @notice Demo pool shape: ETH/USDC, fee 500, tick spacing 10 (MATH.md §1).
     uint24 internal constant POOL_FEE = 500;
     int24 internal constant TICK_SPACING = 10;
 
@@ -77,12 +77,12 @@ abstract contract OathTestBase is Deployers {
             });
     }
 
-    /// @notice Full-range bounds for the pool's tick spacing: −887270 / 887270 for spacing 10 (02_MATH §1).
+    /// @notice Full-range bounds for the pool's tick spacing: −887270 / 887270 for spacing 10 (MATH.md §1).
     function _fullRange() internal pure returns (int24 tickMin, int24 tickMax) {
         return (TickMath.minUsableTick(TICK_SPACING), TickMath.maxUsableTick(TICK_SPACING));
     }
 
-    /// @notice Default vault parameters (01_ARCHITECTURE §6, 00_PRODUCT D6).
+    /// @notice Default vault parameters (MATH.md §12).
     function _defaultParams() internal pure returns (IOathVault.VaultParams memory) {
         return IOathVault.VaultParams({
             epochDuration: 7 days,
@@ -97,7 +97,7 @@ abstract contract OathTestBase is Deployers {
         });
     }
 
-    /// @notice Demo vault parameters: the defaults with 1-day epochs (01_ARCHITECTURE §6).
+    /// @notice Demo vault parameters: the defaults with 1-day epochs (MATH.md §12).
     function _demoParams() internal pure returns (IOathVault.VaultParams memory p) {
         p = _defaultParams();
         p.epochDuration = 1 days;

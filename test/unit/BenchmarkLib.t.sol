@@ -16,15 +16,15 @@ import {BalanceDelta} from "@uniswap/v4-core/src/types/BalanceDelta.sol";
 import {ModifyLiquidityParams} from "@uniswap/v4-core/src/types/PoolOperation.sol";
 import {OathTestBase} from "../utils/OathTestBase.sol";
 
-/// @notice Pure tests for BenchmarkLib (02_MATH §6). Expected values come from the high-precision reference
-///         model; the 02_MATH §9.1 inputs are real (start TWAP tick −199196, V_S = $30,000).
+/// @notice Pure tests for BenchmarkLib (MATH.md §6). Expected values come from the high-precision reference
+///         model; the MATH.md §9.1 inputs are real (start TWAP tick −199196, V_S = $30,000).
 contract BenchmarkLibTest is Test {
     int24 internal constant SPACING = 10;
     int24 internal constant START_TICK = -199196;
     uint256 internal constant NAV_START = 30_000e6;
     uint256 internal constant ONE_CENT = 10_000; // $0.01 in raw USDC units
 
-    /// @dev Real Nov 8–15 fee growth of the ETH/USDC pool (FORK_TEST_REPORT F2), used by 02_MATH §9.1.
+    /// @dev Real Nov 8–15 fee growth of the ETH/USDC pool (MATH.md §13, F2), used by MATH.md §9.1.
     uint256 internal constant DG0 = 5685705715728585446726598611346846337347;
     uint256 internal constant DG1 = 10323568296605520673412669325024;
 
@@ -34,7 +34,7 @@ contract BenchmarkLibTest is Test {
         assertEq(tickMax, 887270);
     }
 
-    /// @dev 02_MATH §9.1: x = 6.708588 ETH (reference 6,708,587,690,738,231,160.896 wei), y = 15,000 USDC.
+    /// @dev MATH.md §9.1: x = 6.708588 ETH (reference 6,708,587,690,738,231,160.896 wei), y = 15,000 USDC.
     function test_split_workedExample() public pure {
         (uint256 x, uint256 y) = BenchmarkLib.split(NAV_START, TickMath.getSqrtPriceAtTick(START_TICK));
         assertApproxEqRel(x, 6_708_587_690_738_231_160, 1e9);
@@ -46,7 +46,7 @@ contract BenchmarkLibTest is Test {
         assertEq(y, 15_000e6 + 1);
     }
 
-    /// @dev 02_MATH §9.1: L_b = 317,220,452,305,763 (reference 317,220,452,305,763.96); leftovers are dust
+    /// @dev MATH.md §9.1: L_b = 317,220,452,305,763 (reference 317,220,452,305,763.96); leftovers are dust
     ///      (reference r0 = 0, r1 = 0.0000172 raw units).
     function test_create_workedExample() public pure {
         uint160 sqrtP = TickMath.getSqrtPriceAtTick(START_TICK);
@@ -55,14 +55,14 @@ contract BenchmarkLibTest is Test {
         assertLe(ValuationLib.value(r0, r1, sqrtP), 1, "leftovers worth <= 1 raw unit ($0.000001)");
     }
 
-    /// @dev 02_MATH §9.1 / §10: the example passes the 0.25% cap against the real pool's active liquidity
+    /// @dev MATH.md §9.1 / §10: the example passes the 0.25% cap against the real pool's active liquidity
     ///      153,902,357,621,796,655 (limit ~3.85e14).
     function test_create_workedExamplePassesCap() public pure {
         (uint128 liquidity,,) = BenchmarkLib.create(NAV_START, TickMath.getSqrtPriceAtTick(START_TICK), SPACING);
         assertLe(liquidity, FullMath.mulDiv(153_902_357_621_796_655, 25, 10_000));
     }
 
-    /// @dev Vault and benchmark start equal by construction (05_SETTLEMENT_SPEC §3): the benchmark's value
+    /// @dev Vault and benchmark start equal by construction (MATH.md §9.3): the benchmark's value
     ///      at the start price is never above V_S and below it only by rounding. Let P be the raw price and
     ///      u = value(1 wei of currency0) + 1, so u ≥ P and u ≥ sqrtP. Then x's double floor loses ≤ sqrtP + P
     ///      ≤ 2u of value, principal-vs-cost rounding ≤ u + 1, and the value floors ≤ 2, so the gap is ≤ 6u.
@@ -91,9 +91,9 @@ contract BenchmarkLibTest is Test {
         assertLe(p1 + r1, y + 1, "currency1 within split");
     }
 
-    // ---------------------------------------------------------------- valueAt (02_MATH §6.2)
+    // ---------------------------------------------------------------- valueAt (MATH.md §6.2)
 
-    /// @dev 02_MATH §9.1 benchmark fees: 0.005300 ETH + 9.62 USDC (reference 5,300,369,088,004,917.41 wei
+    /// @dev MATH.md §9.1 benchmark fees: 0.005300 ETH + 9.62 USDC (reference 5,300,369,088,004,917.41 wei
     ///      and 9,623,910.38 raw USDC).
     function test_valueAt_workedExampleFees() public pure {
         (, uint256 f0, uint256 f1) = BenchmarkLib.valueAt(_exampleBenchmark(), DG0, DG1, _sqrt(-201275), SPACING);
@@ -129,7 +129,7 @@ contract BenchmarkLibTest is Test {
         assertLe(v, NAV_START);
     }
 
-    /// @dev Fee growth wraps past 2^256 (02_MATH §1, 06_SECURITY T16): a start snapshot just below the wrap
+    /// @dev Fee growth wraps past 2^256 (MATH.md §1): a start snapshot just below the wrap
     ///      gives the same fees as the unwrapped growth.
     function testFuzz_valueAt_feeGrowthWrap(uint256 g0Start, uint256 g1Start) public pure {
         IOathVault.Benchmark memory plain = _exampleBenchmark();
@@ -159,7 +159,7 @@ contract BenchmarkLibTest is Test {
         assertEq(f1, e1);
     }
 
-    /// @dev The 02_MATH §9.1 benchmark: created at the start tick with fee growth measured from zero.
+    /// @dev The MATH.md §9.1 benchmark: created at the start tick with fee growth measured from zero.
     function _exampleBenchmark() internal pure returns (IOathVault.Benchmark memory b) {
         (b.L, b.r0, b.r1) = BenchmarkLib.create(NAV_START, _sqrt(START_TICK), SPACING);
         b.navStart = NAV_START;
@@ -171,13 +171,13 @@ contract BenchmarkLibTest is Test {
     }
 }
 
-/// @notice The benchmark identity on the real PoolManager (07_TEST_PLAN §2): a real full-range position of
+/// @notice The benchmark identity on the real PoolManager: a real full-range position of
 ///         `L_b`, added at the start price, withdraws exactly the principal and fees `valueAt` computes from
 ///         two fee-growth reads, to the wei, after any sequence of swaps and donations.
 contract BenchmarkLibPoolTest is OathTestBase {
     using StateLibrary for IPoolManager;
 
-    int24 internal constant START_TICK = -199196; // 02_MATH §9.1
+    int24 internal constant START_TICK = -199196; // MATH.md §9.1
     bytes32 internal constant BENCH_SALT = bytes32(uint256(7));
 
     PoolKey internal poolKey;

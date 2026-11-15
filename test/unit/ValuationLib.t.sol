@@ -14,16 +14,16 @@ import {BalanceDelta} from "@uniswap/v4-core/src/types/BalanceDelta.sol";
 import {ModifyLiquidityParams} from "@uniswap/v4-core/src/types/PoolOperation.sol";
 import {OathTestBase} from "../utils/OathTestBase.sol";
 
-/// @notice Pure unit tests for ValuationLib (02_MATH §2, §3). Expected values come from the high-precision
-///         reference model (02_MATH, exact powers of 1.0001); the contract uses TickMath, so they agree to
+/// @notice Pure unit tests for ValuationLib (MATH.md §2, §3). Expected values come from the high-precision
+///         reference model (MATH.md, exact powers of 1.0001); the contract uses TickMath, so they agree to
 ///         a relative 1e-9 or better.
 contract ValuationLibTest is Test {
     uint160 internal constant SQRT_PRICE_1_1 = 79228162514264337593543950336; // 2^96
-    int24 internal constant T_LO = -199400; // 02_MATH §9.1 curator range
+    int24 internal constant T_LO = -199400; // MATH.md §9.1 curator range
     int24 internal constant T_HI = -199000;
     uint128 internal constant L = 1e16;
 
-    // ---------------------------------------------------------------- value (02_MATH §2)
+    // ---------------------------------------------------------------- value (MATH.md §2)
 
     function test_value_atPriceOneIsSum() public pure {
         assertEq(ValuationLib.value(123e18, 456e6, SQRT_PRICE_1_1), 123e18 + 456e6);
@@ -55,7 +55,7 @@ contract ValuationLibTest is Test {
         assertLe(lo, hi);
     }
 
-    /// @dev 1,000 random (a0, a1, tick) points from the reference model (07_TEST_PLAN §2), generated with
+    /// @dev 1,000 random (a0, a1, tick) points from the reference model, generated with
     ///      a fixed seed: ticks in [−250000, −150000], a0 ≤ 1e22, a1 ≤ 1e12. Relative error ≤ 1e-9.
     function test_value_matchesReferenceVectors() public view {
         string memory json = vm.readFile("test/vectors/valuation.json");
@@ -71,7 +71,7 @@ contract ValuationLibTest is Test {
         }
     }
 
-    // ---------------------------------------------------------------- principal (02_MATH §3)
+    // ---------------------------------------------------------------- principal (MATH.md §3)
 
     /// @dev Below the range: all currency0. Reference: 4,230,310,983,057,256,891.706 wei.
     function test_principal_belowRange() public pure {
@@ -110,7 +110,7 @@ contract ValuationLibTest is Test {
         assertEq(a1, 0);
     }
 
-    /// @dev Rounding direction (02_MATH §1): principal rounds down, so it is at most 1 wei below the
+    /// @dev Rounding direction (MATH.md §1): principal rounds down, so it is at most 1 wei below the
     ///      round-up amounts the pool charges to add the same liquidity, per token.
     function testFuzz_principal_roundsDownByAtMostOneWei(uint128 liquidity, int24 lower, int24 width, int24 tick)
         public
@@ -134,7 +134,7 @@ contract ValuationLibTest is Test {
         assertLe(up1 - a1, 1);
     }
 
-    // ---------------------------------------------------------------- fees and NAV (02_MATH §7)
+    // ---------------------------------------------------------------- fees and NAV (MATH.md §7)
 
     function test_feesOwed_basic() public pure {
         // 1 unit of growth per liquidity (2^128) over L = 1e16 owes exactly 1e16.
@@ -167,12 +167,12 @@ contract ValuationLibTest is Test {
     }
 }
 
-/// @notice ValuationLib against the real PoolManager (07_TEST_PLAN §2): `principal` equals the amounts a
+/// @notice ValuationLib against the real PoolManager: `principal` equals the amounts a
 ///         real withdrawal returns, to the wei, below, inside and above the range and at both boundaries.
 contract ValuationLibPoolTest is OathTestBase {
     using StateLibrary for IPoolManager;
 
-    int24 internal constant START_TICK = -199196; // 02_MATH §9.1
+    int24 internal constant START_TICK = -199196; // MATH.md §9.1
     bytes32 internal constant BACKGROUND_SALT = bytes32(uint256(1));
     bytes32 internal constant POSITION_SALT = bytes32(uint256(2));
 
@@ -246,7 +246,7 @@ contract ValuationLibPoolTest is OathTestBase {
         assertEq(int256(out.amount1()), int256(p1), "amount1 to the wei");
     }
 
-    /// @dev NAV with uncollected fees (02_MATH §7): after swaps through the position, principal plus
+    /// @dev NAV with uncollected fees (MATH.md §7): after swaps through the position, principal plus
     ///      `feesOwed` (fee growth inside since the last collection) equals what a real withdrawal pays.
     function test_nav_feesAndPrincipalEqualWithdrawal() public {
         _assertNavEqualsWithdrawal(-199400, -199000, 1e17, 4);
@@ -255,7 +255,7 @@ contract ValuationLibPoolTest is OathTestBase {
     function testFuzz_nav_feesAndPrincipalEqualWithdrawal(uint128 liquidity, int24 lower, int24 width, uint8 swaps)
         public
     {
-        // Down to L = 1e14 (the 02_MATH §9.1 curator position is ~3.1e16): smaller positions earn < 1 wei of
+        // Down to L = 1e14 (the MATH.md §9.1 curator position is ~3.1e16): smaller positions earn < 1 wei of
         // currency1 fees per crossing, which v4 correctly rounds to 0, so "earned fees" would not be testable.
         liquidity = uint128(bound(liquidity, 1e14, 1e20));
         int24 tA = int24(bound(lower, -200_000, -198_400)) / TICK_SPACING * TICK_SPACING;

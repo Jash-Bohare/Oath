@@ -10,20 +10,20 @@ import {BenchmarkLib} from "../../src/libraries/BenchmarkLib.sol";
 import {ValuationLib} from "../../src/libraries/ValuationLib.sol";
 import {IOathVault} from "../../src/interfaces/IOathVault.sol";
 
-/// @notice Tests for SettlementLib (02_MATH §9, 05_SETTLEMENT_SPEC §2, §5).
+/// @notice Tests for SettlementLib (MATH.md §9).
 contract SettlementLibTest is Test {
     uint16 internal constant BAND = 35;
     uint16 internal constant PERF = 2_000;
     uint256 internal constant ONE_CENT = 10_000; // $0.01 in raw USDC units
 
-    // 02_MATH §9.1 common inputs (real data where available).
+    // MATH.md §9.1 common inputs (real data where available).
     int24 internal constant START_TICK = -199196;
     uint256 internal constant NAV_START = 30_000e6;
     uint256 internal constant BOND = 3_000e6;
     uint256 internal constant SUPPLY = 30_000e18;
     int24 internal constant RANGE_LO = -199400;
     int24 internal constant RANGE_HI = -199000;
-    uint256 internal constant DG0 = 5685705715728585446726598611346846337347; // FORK_TEST_REPORT F2
+    uint256 internal constant DG0 = 5685705715728585446726598611346846337347; // MATH.md §13, F2
     uint256 internal constant DG1 = 10323568296605520673412669325024;
 
     /// @dev External wrapper so library reverts can be caught with `expectRevert`.
@@ -35,7 +35,7 @@ contract SettlementLibTest is Test {
         return SettlementLib.settle(nav, bench, bond, supply, bandBps, perfBps);
     }
 
-    // ---------------------------------------------------------------- 02_MATH §9.1 worked examples
+    // ---------------------------------------------------------------- MATH.md §9.1 worked examples
 
     /// @dev Loss (real Nov 8–15 move, end $1,816.25): NAV $24,515.96, B_E $27,057.50, d −$2,541.54,
     ///      band $94.70 → bond pays $2,446.84 of $3,000.
@@ -111,7 +111,7 @@ contract SettlementLibTest is Test {
         (bench,,) = BenchmarkLib.valueAt(b, DG0, DG1, sqrtE, 10);
     }
 
-    // ---------------------------------------------------------------- band edges (05_SETTLEMENT_SPEC §5)
+    // ---------------------------------------------------------------- band edges (MATH.md §9.2)
 
     // B_E = $10 → band = 35,000 raw units exactly.
     uint256 internal constant B = 10_000_000;
@@ -187,7 +187,7 @@ contract SettlementLibTest is Test {
 
     // ---------------------------------------------------------------- properties (fuzz)
 
-    /// @dev Exactly one of three outcomes, each matching 02_MATH §9 by formula.
+    /// @dev Exactly one of three outcomes, each matching MATH.md §9 by formula.
     function testFuzz_settle_matchesFormula(
         uint256 nav,
         uint256 bench,
@@ -200,7 +200,7 @@ contract SettlementLibTest is Test {
         bench = bound(bench, 1, 1e30);
         bond = bound(bond, 0, 1e30);
         supply = bound(supply, 1, 1e40);
-        bandBps = uint16(bound(bandBps, 0, 500)); // factory bounds (01_ARCHITECTURE §6)
+        bandBps = uint16(bound(bandBps, 0, 500)); // factory bounds (MATH.md §12)
         perfBps = uint16(bound(perfBps, 0, 5_000));
 
         (uint256 payout, uint256 fee, uint256 shares, int256 diff, uint256 band) =
@@ -221,13 +221,13 @@ contract SettlementLibTest is Test {
         }
     }
 
-    /// @dev Fee-share dilution (07_TEST_PLAN §2): after minting, the curator's shares are worth `fee` of
+    /// @dev Fee-share dilution: after minting, the curator's shares are worth `fee` of
     ///      NAV_E, within 1 raw unit. Holds while a share is worth at most 1 raw unit of currency1, which
     ///      the vault's shares are (18 decimals against USDC's 6).
     function testFuzz_settle_feeSharesWorthFee(uint256 nav, uint256 excess, uint256 supply) public pure {
         nav = bound(nav, 1e6, 1e18);
         supply = bound(supply, nav, 1e40);
-        // Outperformance up to 1.5x the benchmark (02_MATH: fee ≤ 0.5·(d − band) < NAV_E).
+        // Outperformance up to 1.5x the benchmark (MATH.md: fee ≤ 0.5·(d − band) < NAV_E).
         uint256 bench = nav - bound(excess, 0, nav / 3);
         (, uint256 fee, uint256 shares,,) = SettlementLib.settle(nav, bench, 0, supply, BAND, PERF);
         uint256 curatorValue = FullMath.mulDiv(nav, shares, supply + shares);

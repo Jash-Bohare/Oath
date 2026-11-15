@@ -144,7 +144,7 @@ contract OathTestBaseTest is OathTestBase {
         assertEq(abi.encode(d), abi.encode(p));
     }
 
-    /// @dev The factory bounds from 01_ARCHITECTURE §6 hold for both parameter sets.
+    /// @dev The factory bounds from MATH.md §12 hold for both parameter sets.
     function test_base_paramsWithinFactoryBounds() public pure {
         _assertWithinBounds(_defaultParams());
         _assertWithinBounds(_demoParams());
