@@ -67,6 +67,18 @@ contract OathHook is BaseHook {
         emit IOathHook.VaultRegistered(id, vault);
     }
 
+    /// @dev Only the factory can create a pool with this hook, and only after registering its vault, so every
+    ///      Oath pool has exactly one vault. Starts the TWAP accumulator at the pool's creation time
+    ///      (`tickCumulative = 0`, MATH.md §4). Reverts `OnlyFactory()` or `VaultNotRegistered()`.
+    function _beforeInitialize(address sender, PoolKey calldata key, uint160) internal override returns (bytes4) {
+        if (sender != factory) revert IOathHook.OnlyFactory();
+        PoolId id = key.toId();
+        if (configs[id].vault == address(0)) revert IOathHook.VaultNotRegistered();
+        // forge-lint: disable-next-line(unsafe-typecast)
+        oracles[id].lastTimestamp = uint32(block.timestamp); // fits until 2106
+        return IHooks.beforeInitialize.selector;
+    }
+
     /// @dev Observes swaps without changing them: no delta, no fee override. The accumulator update and
     ///      block-start tracking are not wired in yet, so for now this only returns its selector.
     function _beforeSwap(address, PoolKey calldata, SwapParams calldata, bytes calldata)

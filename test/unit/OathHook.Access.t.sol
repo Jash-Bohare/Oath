@@ -108,4 +108,66 @@ contract OathHookAccessTest is OathTestBase {
         assertEq(w, alice);
         assertEq(maxTicks, 20);
     }
+
+    // ---------------------------------------------------------------- beforeInitialize (factory only)
+
+    function test_access_initialize_byFactoryStartsOracle() public {
+        _register();
+        vm.warp(1_700_000_000);
+        vm.prank(factory);
+        manager.initialize(key, SQRT_PRICE_1_1);
+
+        (uint32 lastTimestamp, uint64 lastSwapBlock, int24 blockStartTick, int256 tickCumulative) = hook.oracles(id);
+        assertEq(lastTimestamp, 1_700_000_000);
+        assertEq(lastSwapBlock, 0);
+        assertEq(blockStartTick, 0);
+        assertEq(tickCumulative, 0);
+    }
+
+    /// @dev Threat T14: nobody but the factory can create a pool with the Oath hook, even with a registered
+    ///      vault. The hook itself is excluded: v4 never calls a hook for its own actions, and OathHook has no
+    ///      code path that calls `initialize`.
+    function testFuzz_access_initialize_onlyFactory(address caller) public {
+        vm.assume(caller != factory && caller != address(hook));
+        _register();
+        vm.prank(caller);
+        vm.expectRevert(
+            _hookError(IHooks.beforeInitialize.selector, abi.encodeWithSelector(IOathHook.OnlyFactory.selector))
+        );
+        manager.initialize(key, SQRT_PRICE_1_1);
+    }
+
+    function test_access_initialize_requiresRegisteredVault() public {
+        vm.prank(factory);
+        vm.expectRevert(
+            _hookError(IHooks.beforeInitialize.selector, abi.encodeWithSelector(IOathHook.VaultNotRegistered.selector))
+        );
+        manager.initialize(key, SQRT_PRICE_1_1);
+    }
+
+    /// @dev Registering one pool does not let the factory create another pool with no vault.
+    function test_access_initialize_otherPoolStillNeedsVault() public {
+        _register();
+        PoolKey memory other = key;
+        other.fee = 3000;
+        vm.prank(factory);
+        vm.expectRevert(
+            _hookError(IHooks.beforeInitialize.selector, abi.encodeWithSelector(IOathHook.VaultNotRegistered.selector))
+        );
+        manager.initialize(other, SQRT_PRICE_1_1);
+    }
+
+    // ---------------------------------------------------------------- helpers
+
+    function _register() internal {
+        vm.prank(factory);
+        hook.registerVault(key, vault, 50);
+    }
+
+    /// @dev Registers the vault and creates the pool through the factory, at price 1.
+    function _registerAndInitialize() internal {
+        _register();
+        vm.prank(factory);
+        manager.initialize(key, SQRT_PRICE_1_1);
+    }
 }

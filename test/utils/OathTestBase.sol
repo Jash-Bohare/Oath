@@ -6,6 +6,7 @@ import {MockERC20} from "solmate/src/test/utils/mocks/MockERC20.sol";
 import {IHooks} from "@uniswap/v4-core/src/interfaces/IHooks.sol";
 import {Hooks} from "@uniswap/v4-core/src/libraries/Hooks.sol";
 import {TickMath} from "@uniswap/v4-core/src/libraries/TickMath.sol";
+import {CustomRevert} from "@uniswap/v4-core/src/libraries/CustomRevert.sol";
 import {Currency} from "@uniswap/v4-core/src/types/Currency.sol";
 import {PoolKey} from "@uniswap/v4-core/src/types/PoolKey.sol";
 import {IPoolManager} from "@uniswap/v4-core/src/interfaces/IPoolManager.sol";
@@ -101,6 +102,19 @@ abstract contract OathTestBase is Deployers {
     function _demoParams() internal pure returns (IOathVault.VaultParams memory p) {
         p = _defaultParams();
         p.epochDuration = 1 days;
+    }
+
+    /// @notice The revert data the `PoolManager` produces when the hook at `HOOK_ADDRESS` reverts with `reason`
+    ///         inside the callback `callbackSelector`: v4 wraps it as
+    ///         `WrappedError(hook, callbackSelector, reason, HookCallFailed())`. Use with `vm.expectRevert`.
+    function _hookError(bytes4 callbackSelector, bytes memory reason) internal pure returns (bytes memory) {
+        return abi.encodeWithSelector(
+            CustomRevert.WrappedError.selector,
+            HOOK_ADDRESS,
+            callbackSelector,
+            reason,
+            abi.encodeWithSelector(Hooks.HookCallFailed.selector)
+        );
     }
 
     /// @notice Gives `who` `amount` of `currency` (minted ERC-20, or ETH via `deal` for native).
