@@ -5,6 +5,14 @@ import {Test} from "forge-std/Test.sol";
 import {TickMath} from "@uniswap/v4-core/src/libraries/TickMath.sol";
 import {SqrtPriceMath} from "@uniswap/v4-core/src/libraries/SqrtPriceMath.sol";
 import {ValuationLib} from "../../src/libraries/ValuationLib.sol";
+import {IPoolManager} from "@uniswap/v4-core/src/interfaces/IPoolManager.sol";
+import {IHooks} from "@uniswap/v4-core/src/interfaces/IHooks.sol";
+import {StateLibrary} from "@uniswap/v4-core/src/libraries/StateLibrary.sol";
+import {PoolKey} from "@uniswap/v4-core/src/types/PoolKey.sol";
+import {BalanceDelta} from "@uniswap/v4-core/src/types/BalanceDelta.sol";
+import {SwapParams, ModifyLiquidityParams} from "@uniswap/v4-core/src/types/PoolOperation.sol";
+import {PoolSwapTest} from "@uniswap/v4-core/src/test/PoolSwapTest.sol";
+import {OathTestBase} from "../utils/OathTestBase.sol";
 
 /// @notice Pure unit tests for ValuationLib (02_MATH §2, §3). Expected values come from the high-precision
 ///         reference model (02_MATH, exact powers of 1.0001); the contract uses TickMath, so they agree to
@@ -124,5 +132,97 @@ contract ValuationLibTest is Test {
         assertLe(a1, up1);
         assertLe(up0 - a0, 1);
         assertLe(up1 - a1, 1);
+    }
+}
+
+/// @notice ValuationLib against the real PoolManager (07_TEST_PLAN §2): `principal` equals the amounts a
+///         real withdrawal returns, to the wei, below, inside and above the range and at both boundaries.
+contract ValuationLibPoolTest is OathTestBase {
+    using StateLibrary for IPoolManager;
+
+    int24 internal constant START_TICK = -199196; // 02_MATH §9.1
+    bytes32 internal constant BACKGROUND_SALT = bytes32(uint256(1));
+    bytes32 internal constant POSITION_SALT = bytes32(uint256(2));
+
+    PoolKey internal poolKey;
+
+    function setUp() public override {
+        super.setUp();
+        // A plain pool (no hook) with the demo fee and spacing: ValuationLib does not depend on the hook.
+        poolKey = PoolKey(currency0, currency1, POOL_FEE, TICK_SPACING, IHooks(address(0)));
+        manager.initialize(poolKey, TickMath.getSqrtPriceAtTick(START_TICK));
+        // Deep full-range background liquidity so swaps can move the price anywhere we need.
+        (int24 tickMin, int24 tickMax) = _fullRange();
+        modifyLiquidityRouter.modifyLiquidity(
+            poolKey, ModifyLiquidityParams(tickMin, tickMax, 1e22, BACKGROUND_SALT), ZERO_BYTES
+        );
+    }
+
+    function test_principal_equalsWithdrawalBelowRange() public {
+        _assertPrincipalEqualsWithdrawal(-199400, -199000, 1e16, TickMath.getSqrtPriceAtTick(-199900));
+    }
+
+    function test_principal_equalsWithdrawalInsideRange() public {
+        _assertPrincipalEqualsWithdrawal(-199400, -199000, 1e16, TickMath.getSqrtPriceAtTick(-199123) + 12_345);
+    }
+
+    function test_principal_equalsWithdrawalAboveRange() public {
+        _assertPrincipalEqualsWithdrawal(-199400, -199000, 1e16, TickMath.getSqrtPriceAtTick(-198500));
+    }
+
+    /// @dev Price exactly at the lower bound, reached by a downward swap (pool tick = tA − 1).
+    function test_principal_equalsWithdrawalAtLowerBoundFromAbove() public {
+        _assertPrincipalEqualsWithdrawal(-199400, -199000, 1e16, TickMath.getSqrtPriceAtTick(-199400));
+    }
+
+    /// @dev Price exactly at the lower bound, reached by an upward swap (pool tick = tA).
+    function test_principal_equalsWithdrawalAtLowerBoundFromBelow() public {
+        _moveTo(TickMath.getSqrtPriceAtTick(-199600));
+        _assertPrincipalEqualsWithdrawal(-199400, -199000, 1e16, TickMath.getSqrtPriceAtTick(-199400));
+    }
+
+    function test_principal_equalsWithdrawalAtUpperBound() public {
+        _assertPrincipalEqualsWithdrawal(-199400, -199000, 1e16, TickMath.getSqrtPriceAtTick(-199000));
+    }
+
+    function testFuzz_principal_equalsWithdrawal(uint128 liquidity, int24 lower, int24 width, uint256 priceSeed)
+        public
+    {
+        liquidity = uint128(bound(liquidity, 1e6, 1e20));
+        int24 tA = int24(bound(lower, -202_000, -197_000)) / TICK_SPACING * TICK_SPACING;
+        int24 tB = tA + int24(bound(width, 1, 400)) * TICK_SPACING;
+        uint160 sqrtP =
+            uint160(bound(priceSeed, TickMath.getSqrtPriceAtTick(tA - 1_000), TickMath.getSqrtPriceAtTick(tB + 1_000)));
+        _assertPrincipalEqualsWithdrawal(tA, tB, liquidity, sqrtP);
+    }
+
+    /// @dev Moves the pool to `sqrtP`, adds liquidity on [tA, tB), removes it immediately (no swaps in
+    ///      between, so no fees) and checks the received amounts against `principal` at the pool price.
+    function _assertPrincipalEqualsWithdrawal(int24 tA, int24 tB, uint128 liquidity, uint160 sqrtP) internal {
+        _moveTo(sqrtP);
+        (uint160 poolSqrtP,,,) = manager.getSlot0(poolKey.toId());
+        assertEq(poolSqrtP, sqrtP, "pool at target price");
+
+        int256 l = int256(uint256(liquidity));
+        modifyLiquidityRouter.modifyLiquidity(poolKey, ModifyLiquidityParams(tA, tB, l, POSITION_SALT), ZERO_BYTES);
+        BalanceDelta out = modifyLiquidityRouter.modifyLiquidity(
+            poolKey, ModifyLiquidityParams(tA, tB, -l, POSITION_SALT), ZERO_BYTES
+        );
+
+        (uint256 p0, uint256 p1) = ValuationLib.principal(liquidity, tA, tB, poolSqrtP);
+        assertEq(int256(out.amount0()), int256(p0), "amount0 to the wei");
+        assertEq(int256(out.amount1()), int256(p1), "amount1 to the wei");
+    }
+
+    /// @dev Swaps exact-input against the background liquidity until the price is exactly `target`.
+    function _moveTo(uint160 target) internal {
+        (uint160 current,,,) = manager.getSlot0(poolKey.toId());
+        if (current == target) return;
+        swapRouter.swap(
+            poolKey,
+            SwapParams({zeroForOne: target < current, amountSpecified: -1e40, sqrtPriceLimitX96: target}),
+            PoolSwapTest.TestSettings({takeClaims: false, settleUsingBurn: false}),
+            ZERO_BYTES
+        );
     }
 }
