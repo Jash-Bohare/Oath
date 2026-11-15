@@ -7,6 +7,8 @@ import {PoolKey} from "@uniswap/v4-core/src/types/PoolKey.sol";
 import {PoolId} from "@uniswap/v4-core/src/types/PoolId.sol";
 import {IOathHook} from "../../src/interfaces/IOathHook.sol";
 import {OathHook} from "../../src/OathHook.sol";
+import {BaseHook} from "@openzeppelin/uniswap-hooks/base/BaseHook.sol";
+import {SwapParams} from "@uniswap/v4-core/src/types/PoolOperation.sol";
 import {OathTestBase, oathPermissions} from "../utils/OathTestBase.sol";
 
 /// @notice Access control of OathHook on the real PoolManager: permissions, vault registration,
@@ -267,6 +269,46 @@ contract OathHookAccessTest is OathTestBase {
         _registerAndInitialize();
         IOathHook.Epoch memory e = hook.epochData(key);
         assertEq(abi.encode(e), abi.encode(IOathHook.Epoch(0, 0, false, false, false, false, 0, 0, 0, 0, 0, 0)));
+    }
+
+    // ---------------------------------------------------------------- callbacks and open pools
+
+    /// @dev Every callback rejects any caller except the PoolManager.
+    function test_access_callbacksOnlyFromPoolManager() public {
+        _registerAndInitialize();
+        vm.startPrank(factory);
+        vm.expectRevert(BaseHook.NotPoolManager.selector);
+        hook.beforeInitialize(factory, key, SQRT_PRICE_1_1);
+        vm.expectRevert(BaseHook.NotPoolManager.selector);
+        hook.beforeAddLiquidity(vault, key, LIQUIDITY_PARAMS, ZERO_BYTES);
+        vm.expectRevert(BaseHook.NotPoolManager.selector);
+        hook.beforeRemoveLiquidity(vault, key, REMOVE_LIQUIDITY_PARAMS, ZERO_BYTES);
+        vm.expectRevert(BaseHook.NotPoolManager.selector);
+        hook.beforeSwap(alice, key, SwapParams({zeroForOne: true, amountSpecified: -1, sqrtPriceLimitX96: 0}), "");
+        vm.expectRevert(BaseHook.NotPoolManager.selector);
+        hook.beforeDonate(alice, key, 1, 1, ZERO_BYTES);
+        vm.stopPrank();
+    }
+
+    /// @dev Oath pools are open: anyone may add, swap, donate and remove, and the hook holds no funds.
+    function test_access_openPoolForOtherUsers() public {
+        _registerAndInitialize();
+        modifyLiquidityRouter.modifyLiquidity(key, LIQUIDITY_PARAMS, ZERO_BYTES);
+        swap(key, true, -1e15, ZERO_BYTES);
+        swap(key, false, -1e15, ZERO_BYTES);
+        donateRouter.donate(key, 1e12, 1e12, ZERO_BYTES);
+        modifyLiquidityRouter.modifyLiquidity(key, REMOVE_LIQUIDITY_PARAMS, ZERO_BYTES);
+
+        assertEq(currency0.balanceOf(address(hook)), 0, "no currency0");
+        assertEq(currency1.balanceOf(address(hook)), 0, "no currency1");
+        assertEq(manager.balanceOf(address(hook), currency0.toId()), 0, "no claims0");
+        assertEq(manager.balanceOf(address(hook), currency1.toId()), 0, "no claims1");
+    }
+
+    function testFuzz_access_pokeByAnyone(address caller) public {
+        _registerAndInitialize();
+        vm.prank(caller);
+        hook.poke(key);
     }
 
     // ---------------------------------------------------------------- helpers
