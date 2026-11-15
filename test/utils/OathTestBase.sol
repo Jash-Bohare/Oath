@@ -8,6 +8,10 @@ import {Hooks} from "@uniswap/v4-core/src/libraries/Hooks.sol";
 import {TickMath} from "@uniswap/v4-core/src/libraries/TickMath.sol";
 import {Currency} from "@uniswap/v4-core/src/types/Currency.sol";
 import {PoolKey} from "@uniswap/v4-core/src/types/PoolKey.sol";
+import {IPoolManager} from "@uniswap/v4-core/src/interfaces/IPoolManager.sol";
+import {StateLibrary} from "@uniswap/v4-core/src/libraries/StateLibrary.sol";
+import {SwapParams} from "@uniswap/v4-core/src/types/PoolOperation.sol";
+import {PoolSwapTest} from "@uniswap/v4-core/src/test/PoolSwapTest.sol";
 import {IOathHook} from "../../src/interfaces/IOathHook.sol";
 import {IOathVault} from "../../src/interfaces/IOathVault.sol";
 
@@ -27,6 +31,8 @@ function oathPermissions() pure returns (Hooks.Permissions memory p) {
 /// @dev The hook can only live at an address whose low 14 bits equal its permission flags (03_HOOK_SPEC §1),
 ///      so it is deployed with `deployCodeTo` at `HOOK_ADDRESS`.
 abstract contract OathTestBase is Deployers {
+    using StateLibrary for IPoolManager;
+
     /// @notice OathHook permission flags: beforeInitialize | beforeAddLiquidity | beforeRemoveLiquidity |
     ///         beforeSwap | beforeDonate = 0x2AA0 (03_HOOK_SPEC §1).
     uint160 internal constant HOOK_FLAGS = Hooks.BEFORE_INITIALIZE_FLAG | Hooks.BEFORE_ADD_LIQUIDITY_FLAG
@@ -104,5 +110,18 @@ abstract contract OathTestBase is Deployers {
         } else {
             MockERC20(Currency.unwrap(currency)).mint(who, amount);
         }
+    }
+
+    /// @notice Swaps exact-input through `key` until its price is exactly `target` (the swap's price limit).
+    ///         No-op if the pool is already there. The pool needs enough liquidity on the way.
+    function _moveTo(PoolKey memory key, uint160 target) internal {
+        (uint160 current,,,) = manager.getSlot0(key.toId());
+        if (current == target) return;
+        swapRouter.swap(
+            key,
+            SwapParams({zeroForOne: target < current, amountSpecified: -1e40, sqrtPriceLimitX96: target}),
+            PoolSwapTest.TestSettings({takeClaims: false, settleUsingBurn: false}),
+            ZERO_BYTES
+        );
     }
 }

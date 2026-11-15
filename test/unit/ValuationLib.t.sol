@@ -11,8 +11,7 @@ import {StateLibrary} from "@uniswap/v4-core/src/libraries/StateLibrary.sol";
 import {PoolKey} from "@uniswap/v4-core/src/types/PoolKey.sol";
 import {PoolId} from "@uniswap/v4-core/src/types/PoolId.sol";
 import {BalanceDelta} from "@uniswap/v4-core/src/types/BalanceDelta.sol";
-import {SwapParams, ModifyLiquidityParams} from "@uniswap/v4-core/src/types/PoolOperation.sol";
-import {PoolSwapTest} from "@uniswap/v4-core/src/test/PoolSwapTest.sol";
+import {ModifyLiquidityParams} from "@uniswap/v4-core/src/types/PoolOperation.sol";
 import {OathTestBase} from "../utils/OathTestBase.sol";
 
 /// @notice Pure unit tests for ValuationLib (02_MATH §2, §3). Expected values come from the high-precision
@@ -210,7 +209,7 @@ contract ValuationLibPoolTest is OathTestBase {
 
     /// @dev Price exactly at the lower bound, reached by an upward swap (pool tick = tA).
     function test_principal_equalsWithdrawalAtLowerBoundFromBelow() public {
-        _moveTo(TickMath.getSqrtPriceAtTick(-199600));
+        _moveTo(poolKey, TickMath.getSqrtPriceAtTick(-199600));
         _assertPrincipalEqualsWithdrawal(-199400, -199000, 1e16, TickMath.getSqrtPriceAtTick(-199400));
     }
 
@@ -232,7 +231,7 @@ contract ValuationLibPoolTest is OathTestBase {
     /// @dev Moves the pool to `sqrtP`, adds liquidity on [tA, tB), removes it immediately (no swaps in
     ///      between, so no fees) and checks the received amounts against `principal` at the pool price.
     function _assertPrincipalEqualsWithdrawal(int24 tA, int24 tB, uint128 liquidity, uint160 sqrtP) internal {
-        _moveTo(sqrtP);
+        _moveTo(poolKey, sqrtP);
         (uint160 poolSqrtP,,,) = manager.getSlot0(poolKey.toId());
         assertEq(poolSqrtP, sqrtP, "pool at target price");
 
@@ -270,7 +269,7 @@ contract ValuationLibPoolTest is OathTestBase {
         int256 l = int256(uint256(liquidity));
         modifyLiquidityNoChecks.modifyLiquidity(poolKey, ModifyLiquidityParams(tA, tB, l, POSITION_SALT), ZERO_BYTES);
         for (uint256 i = 0; i < swaps; i++) {
-            _moveTo(TickMath.getSqrtPriceAtTick(START_TICK + (i % 2 == 0 ? int24(-1_500) : int24(3_500))));
+            _moveTo(poolKey, TickMath.getSqrtPriceAtTick(START_TICK + (i % 2 == 0 ? int24(-1_500) : int24(3_500))));
         }
         (uint160 sqrtP,,,) = manager.getSlot0(poolKey.toId());
 
@@ -292,17 +291,5 @@ contract ValuationLibPoolTest is OathTestBase {
         assertEq(int256(out.amount0()), int256(p0 + f0), "amount0 = principal0 + fees0, to the wei");
         assertEq(int256(out.amount1()), int256(p1 + f1), "amount1 = principal1 + fees1, to the wei");
         assertEq(navValue, ValuationLib.value(uint128(out.amount0()), uint128(out.amount1()), sqrtP), "nav");
-    }
-
-    /// @dev Swaps exact-input against the background liquidity until the price is exactly `target`.
-    function _moveTo(uint160 target) internal {
-        (uint160 current,,,) = manager.getSlot0(poolKey.toId());
-        if (current == target) return;
-        swapRouter.swap(
-            poolKey,
-            SwapParams({zeroForOne: target < current, amountSpecified: -1e40, sqrtPriceLimitX96: target}),
-            PoolSwapTest.TestSettings({takeClaims: false, settleUsingBurn: false}),
-            ZERO_BYTES
-        );
     }
 }
