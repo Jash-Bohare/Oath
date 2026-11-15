@@ -20,3 +20,7 @@ runs = 256
 
 [fmt]
 line_length = 120
+
+[lint]
+# Lint production code; tests intentionally use repeated literals, loops and ignored router returns.
+ignore = ["test/**/*.sol"]
