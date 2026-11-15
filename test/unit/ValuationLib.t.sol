@@ -47,6 +47,22 @@ contract ValuationLibTest is Test {
         assertLe(lo, hi);
     }
 
+    /// @dev 1,000 random (a0, a1, tick) points from the reference model (07_TEST_PLAN §2), generated with
+    ///      a fixed seed: ticks in [−250000, −150000], a0 ≤ 1e22, a1 ≤ 1e12. Relative error ≤ 1e-9.
+    function test_value_matchesReferenceVectors() public view {
+        string memory json = vm.readFile("test/vectors/valuation.json");
+        assertTrue(vm.keyExistsJson(json, ".[999]") && !vm.keyExistsJson(json, ".[1000]"), "exactly 1,000");
+        for (uint256 i = 0; i < 1_000; i++) {
+            string memory at = string.concat(".[", vm.toString(i), "]");
+            uint256 got = ValuationLib.value(
+                vm.parseJsonUint(json, string.concat(at, ".a0")),
+                vm.parseJsonUint(json, string.concat(at, ".a1")),
+                TickMath.getSqrtPriceAtTick(int24(vm.parseJsonInt(json, string.concat(at, ".tick"))))
+            );
+            assertApproxEqRel(got, vm.parseJsonUint(json, string.concat(at, ".value")), 1e9, vm.toString(i));
+        }
+    }
+
     // ---------------------------------------------------------------- principal (02_MATH §3)
 
     /// @dev Below the range: all currency0. Reference: 4,230,310,983,057,256,891.706 wei.
