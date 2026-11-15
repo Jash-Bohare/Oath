@@ -6,6 +6,7 @@ import {FullMath} from "@uniswap/v4-core/src/libraries/FullMath.sol";
 import {TickMath} from "@uniswap/v4-core/src/libraries/TickMath.sol";
 import {BenchmarkLib} from "../../src/libraries/BenchmarkLib.sol";
 import {ValuationLib} from "../../src/libraries/ValuationLib.sol";
+import {IOathVault} from "../../src/interfaces/IOathVault.sol";
 
 /// @notice Pure tests for BenchmarkLib (02_MATH §6). Expected values come from the high-precision reference
 ///         model; the 02_MATH §9.1 inputs are real (start TWAP tick −199196, V_S = $30,000).
@@ -13,6 +14,11 @@ contract BenchmarkLibTest is Test {
     int24 internal constant SPACING = 10;
     int24 internal constant START_TICK = -199196;
     uint256 internal constant NAV_START = 30_000e6;
+    uint256 internal constant ONE_CENT = 10_000; // $0.01 in raw USDC units
+
+    /// @dev Real Nov 8–15 fee growth of the ETH/USDC pool (FORK_TEST_REPORT F2), used by 02_MATH §9.1.
+    uint256 internal constant DG0 = 5685705715728585446726598611346846337347;
+    uint256 internal constant DG1 = 10323568296605520673412669325024;
 
     function test_fullRange_spacing10() public pure {
         (int24 tickMin, int24 tickMax) = BenchmarkLib.fullRange(SPACING);
@@ -75,5 +81,84 @@ contract BenchmarkLibTest is Test {
         (uint256 p0, uint256 p1) = ValuationLib.principal(liquidity, tickMin, tickMax, sqrtP);
         assertLe(p0 + r0, x + 1, "currency0 within split");
         assertLe(p1 + r1, y + 1, "currency1 within split");
+    }
+
+    // ---------------------------------------------------------------- valueAt (02_MATH §6.2)
+
+    /// @dev 02_MATH §9.1 benchmark fees: 0.005300 ETH + 9.62 USDC (reference 5,300,369,088,004,917.41 wei
+    ///      and 9,623,910.38 raw USDC).
+    function test_valueAt_workedExampleFees() public pure {
+        (, uint256 f0, uint256 f1) = BenchmarkLib.valueAt(_exampleBenchmark(), DG0, DG1, _sqrt(-201275), SPACING);
+        assertApproxEqRel(f0, 5_300_369_088_004_917, 1e9);
+        assertApproxEqRel(f1, 9_623_910, 1e9);
+    }
+
+    /// @dev Loss example: end tick −201275 ($1,816.25); B_E = $27,057.50 (reference 27,057,502,004.45 raw).
+    function test_valueAt_workedExampleLoss() public pure {
+        (uint256 b,,) = BenchmarkLib.valueAt(_exampleBenchmark(), DG0, DG1, _sqrt(-201275), SPACING);
+        assertApproxEqAbs(b, 27_057_502_004, ONE_CENT);
+    }
+
+    /// @dev Win example: end tick −199150 ($2,246.25); B_E = $30,090.61 (reference 30,090,605,810.00 raw).
+    function test_valueAt_workedExampleWin() public pure {
+        (uint256 b,,) = BenchmarkLib.valueAt(_exampleBenchmark(), DG0, DG1, _sqrt(-199150), SPACING);
+        assertApproxEqAbs(b, 30_090_605_810, ONE_CENT);
+    }
+
+    /// @dev Flat example: end tick −199196 ($2,235.94); B_E = $30,021.48 (reference 30,021,475,217.99 raw).
+    function test_valueAt_workedExampleFlat() public pure {
+        (uint256 b,,) = BenchmarkLib.valueAt(_exampleBenchmark(), DG0, DG1, _sqrt(-199196), SPACING);
+        assertApproxEqAbs(b, 30_021_475_217, ONE_CENT);
+    }
+
+    /// @dev With no fee growth and no price move, the benchmark is worth its start value (within rounding).
+    function test_valueAt_noGrowthNoMoveIsStartValue() public pure {
+        IOathVault.Benchmark memory b = _exampleBenchmark();
+        (uint256 v, uint256 f0, uint256 f1) = BenchmarkLib.valueAt(b, b.G0, b.G1, _sqrt(START_TICK), SPACING);
+        assertEq(f0, 0);
+        assertEq(f1, 0);
+        assertApproxEqAbs(v, NAV_START, 6);
+        assertLe(v, NAV_START);
+    }
+
+    /// @dev Fee growth wraps past 2^256 (02_MATH §1, 06_SECURITY T16): a start snapshot just below the wrap
+    ///      gives the same fees as the unwrapped growth.
+    function testFuzz_valueAt_feeGrowthWrap(uint256 g0Start, uint256 g1Start) public pure {
+        IOathVault.Benchmark memory plain = _exampleBenchmark();
+        IOathVault.Benchmark memory wrapped = _exampleBenchmark();
+        wrapped.G0 = g0Start;
+        wrapped.G1 = g1Start;
+        uint256 g0End;
+        uint256 g1End;
+        unchecked {
+            g0End = g0Start + DG0;
+            g1End = g1Start + DG1;
+        }
+        (uint256 v1, uint256 a0, uint256 a1) = BenchmarkLib.valueAt(plain, DG0, DG1, _sqrt(-201275), SPACING);
+        (uint256 v2, uint256 b0, uint256 b1) = BenchmarkLib.valueAt(wrapped, g0End, g1End, _sqrt(-201275), SPACING);
+        assertEq(v1, v2);
+        assertEq(a0, b0);
+        assertEq(a1, b1);
+    }
+
+    function test_valueAt_feeGrowthWrapExample() public pure {
+        IOathVault.Benchmark memory b = _exampleBenchmark();
+        b.G0 = type(uint256).max - 41;
+        b.G1 = type(uint256).max;
+        (, uint256 f0, uint256 f1) = BenchmarkLib.valueAt(b, DG0 - 42, DG1 - 1, _sqrt(-201275), SPACING);
+        (, uint256 e0, uint256 e1) = BenchmarkLib.valueAt(_exampleBenchmark(), DG0, DG1, _sqrt(-201275), SPACING);
+        assertEq(f0, e0);
+        assertEq(f1, e1);
+    }
+
+    /// @dev The 02_MATH §9.1 benchmark: created at the start tick with fee growth measured from zero.
+    function _exampleBenchmark() internal pure returns (IOathVault.Benchmark memory b) {
+        (b.L, b.r0, b.r1) = BenchmarkLib.create(NAV_START, _sqrt(START_TICK), SPACING);
+        b.navStart = NAV_START;
+        b.startTick = START_TICK;
+    }
+
+    function _sqrt(int24 tick) internal pure returns (uint160) {
+        return TickMath.getSqrtPriceAtTick(tick);
     }
 }

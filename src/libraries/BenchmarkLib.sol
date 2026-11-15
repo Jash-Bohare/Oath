@@ -6,6 +6,8 @@ import {FixedPoint96} from "@uniswap/v4-core/src/libraries/FixedPoint96.sol";
 import {SqrtPriceMath} from "@uniswap/v4-core/src/libraries/SqrtPriceMath.sol";
 import {TickMath} from "@uniswap/v4-core/src/libraries/TickMath.sol";
 import {LiquidityAmounts} from "@uniswap/v4-periphery/src/libraries/LiquidityAmounts.sol";
+import {IOathVault} from "../interfaces/IOathVault.sol";
+import {ValuationLib} from "./ValuationLib.sol";
 
 /// @title BenchmarkLib
 /// @notice The counterfactual Oath measures every curator against: the vault's start value placed full-range
@@ -67,5 +69,34 @@ library BenchmarkLib {
         uint256 cost1 = SqrtPriceMath.getAmount1Delta(sqrtMin, s, liquidity, true);
         r0 = x > cost0 ? x - cost0 : 0;
         r1 = y > cost1 ? y - cost1 : 0;
+    }
+
+    /// @notice Values the benchmark at epoch end (02_MATH §6.2): its full-range principal at the end price,
+    ///         plus the fees `L_b` earned from global fee growth over the epoch, plus the leftovers.
+    ///         `(p0, p1) = principal(L_b, tickMin, tickMax, sqrtP_E)`;
+    ///         `f_i = mulDiv(G_i,E − G_i,S, L_b, Q128)` (unchecked difference);
+    ///         `B_E = value(p0 + f0 + r0, p1 + f1 + r1, sqrtP_E)`.
+    /// @dev Exactness (FORK_TEST_REPORT F1–F3): principal and fees match a real full-range position to the
+    ///      wei, and full-range fee growth inside equals global fee growth.
+    /// @param benchmark The epoch's benchmark (`L`, `r0`, `r1`, `G0`, `G1` at start are used).
+    /// @param g0End Global fee growth of currency0 at `E` (the hook's boundary snapshot).
+    /// @param g1End Global fee growth of currency1 at `E`.
+    /// @param sqrtPriceX96 End TWAP price `sqrtP_E`.
+    /// @param tickSpacing The pool's tick spacing.
+    /// @return benchValue Benchmark value `B_E` in raw currency1 units.
+    /// @return fees0 Benchmark fees in currency0 over the epoch.
+    /// @return fees1 Benchmark fees in currency1 over the epoch.
+    function valueAt(
+        IOathVault.Benchmark memory benchmark,
+        uint256 g0End,
+        uint256 g1End,
+        uint160 sqrtPriceX96,
+        int24 tickSpacing
+    ) internal pure returns (uint256 benchValue, uint256 fees0, uint256 fees1) {
+        (int24 tickMin, int24 tickMax) = fullRange(tickSpacing);
+        (uint256 p0, uint256 p1) = ValuationLib.principal(benchmark.L, tickMin, tickMax, sqrtPriceX96);
+        fees0 = ValuationLib.feesOwed(benchmark.L, benchmark.G0, g0End);
+        fees1 = ValuationLib.feesOwed(benchmark.L, benchmark.G1, g1End);
+        benchValue = ValuationLib.value(p0 + fees0 + benchmark.r0, p1 + fees1 + benchmark.r1, sqrtPriceX96);
     }
 }
