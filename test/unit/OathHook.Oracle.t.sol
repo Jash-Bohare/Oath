@@ -213,6 +213,73 @@ contract OathHookOracleTest is OathTestBase {
         _assertBlockStart(swapBlock, START_TICK);
     }
 
+    // ---------------------------------------------------------------- brute force
+
+    /// @dev Every (time, tick) segment the pool has been through since creation.
+    uint256[] internal segTimes;
+    int24[] internal segTicks;
+
+    /// @dev `cumulativeNow` equals the brute-force Σ tick·dt over the pool's whole history, after any sequence
+    ///      of swaps (moving or not, several per block), donations, pokes, liquidity changes and time jumps
+    ///      from 0 s to 2 days. The reference re-sums every segment from scratch at each check, sharing nothing
+    ///      with the hook's incremental update.
+    function testFuzz_oracle_matchesBruteForce(uint256 seed, int24 startTick) public {
+        startTick = int24(bound(startTick, -400_000, 400_000));
+        _createPool(startTick);
+        _record();
+        assertEq(hook.cumulativeNow(key), 0, "creation");
+
+        for (uint256 i; i < 24; i++) {
+            uint256 r = uint256(keccak256(abi.encode(seed, i)));
+            // Half the steps stay in the same block (0 s); the rest jump up to 2 days ahead.
+            if (r % 2 == 1) _nextBlock(1 + (r >> 8) % 2 days);
+
+            uint256 action = (r >> 64) % 6;
+            if (action <= 1) {
+                // Move to a target up to ±50,000 ticks from the start tick.
+                _moveToTick(startTick + int24(int256((r >> 96) % 100_001)) - 50_000);
+            } else if (action == 2) {
+                // A small swap that may not move the tick at all.
+                swap(key, (r >> 96) % 2 == 0, -int256(1 + (r >> 128) % 1e12), ZERO_BYTES);
+            } else if (action == 3) {
+                donateRouter.donate(key, 1e6, 1e6, ZERO_BYTES);
+            } else if (action == 4) {
+                hook.poke(key);
+            } else {
+                modifyLiquidityRouter.modifyLiquidity(key, LIQUIDITY_PARAMS, ZERO_BYTES);
+                modifyLiquidityRouter.modifyLiquidity(key, REMOVE_LIQUIDITY_PARAMS, ZERO_BYTES);
+            }
+            _record();
+            assertEq(hook.cumulativeNow(key), _bruteForce(), "after step");
+        }
+
+        _wait(seed % 3 days);
+        assertEq(hook.cumulativeNow(key), _bruteForce(), "end");
+        hook.poke(key);
+        (uint32 ts,,, int256 stored) = hook.oracles(id);
+        assertEq(stored, _bruteForce(), "stored after poke");
+        assertEq(ts, _time(), "lastTimestamp after poke");
+    }
+
+    /// @dev Appends the current (time, tick) if the tick changed since the last segment.
+    function _record() internal {
+        int24 tick = _tick();
+        uint256 n = segTicks.length;
+        if (n == 0 || segTicks[n - 1] != tick) {
+            segTimes.push(_time());
+            segTicks.push(tick);
+        }
+    }
+
+    /// @dev Σ tick_i · (t_{i+1} − t_i) over all segments, the last one running to now.
+    function _bruteForce() internal view returns (int256 sum) {
+        uint256 n = segTicks.length;
+        for (uint256 i; i < n; i++) {
+            uint256 end = i + 1 < n ? segTimes[i + 1] : _time();
+            sum += int256(segTicks[i]) * int256(end - segTimes[i]);
+        }
+    }
+
     // ---------------------------------------------------------------- helpers
 
     /// @dev Registers the vault, creates the pool through the factory at `tick`, and adds deep full-range
