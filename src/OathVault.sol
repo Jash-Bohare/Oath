@@ -57,8 +57,6 @@ contract OathVault is ERC20, ReentrancyGuardTransient {
     IOathVault.State public state;
     /// @notice Currency1 held as the curator's bond. Part of the vault's currency1 balance, but not of `idle1`
     ///         or of NAV.
-    /// @dev Zero until `postBond` exists to write it.
-    // forge-lint: disable-next-line(uninitialized-state)
     uint256 public bondBalance;
     /// @notice Open-window start `T0`: when the current open window began.
     uint32 public openSince;
@@ -186,6 +184,31 @@ contract OathVault is ERC20, ReentrancyGuardTransient {
         emit IOathVault.Withdraw(msg.sender, receiver, out0, out1, shares);
         if (out0 != 0) CURRENCY0.transfer(receiver, out0);
         if (out1 != 0) CURRENCY1.transfer(receiver, out1);
+    }
+
+    // ---------------------------------------------------------------- bond
+
+    /// @notice Adds `amount` currency1 to the curator's bond. Curator only, in any state.
+    /// @dev The bond is held by the vault but excluded from `idle1`, shares and NAV. Reverts `NotCurator()`.
+    /// @param amount Currency1 to pull from the curator.
+    function postBond(uint256 amount) external nonReentrant {
+        if (msg.sender != CURATOR) revert IOathVault.NotCurator();
+        IERC20(Currency.unwrap(CURRENCY1)).safeTransferFrom(msg.sender, address(this), amount);
+        bondBalance += amount;
+        emit IOathVault.BondPosted(amount, bondBalance);
+    }
+
+    /// @notice Sends `amount` currency1 of the bond back to the curator. Curator only, open window only: during
+    ///         an epoch the bond backs the curator's result.
+    /// @dev Reverts `NotCurator()`, `NotOpen()`, `InsufficientBond()`.
+    /// @param amount Currency1 to withdraw from the bond.
+    function withdrawBond(uint256 amount) external nonReentrant {
+        if (msg.sender != CURATOR) revert IOathVault.NotCurator();
+        if (state != IOathVault.State.OPEN) revert IOathVault.NotOpen();
+        if (amount > bondBalance) revert IOathVault.InsufficientBond();
+        bondBalance -= amount;
+        emit IOathVault.BondWithdrawn(amount, bondBalance);
+        CURRENCY1.transfer(msg.sender, amount);
     }
 
     // ---------------------------------------------------------------- open window
