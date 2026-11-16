@@ -2,9 +2,14 @@
 pragma solidity 0.8.26;
 
 import {ERC20} from "@openzeppelin/contracts/token/ERC20/ERC20.sol";
+import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import {IERC20Metadata} from "@openzeppelin/contracts/token/ERC20/extensions/IERC20Metadata.sol";
+import {SafeERC20} from "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
+import {Math} from "@openzeppelin/contracts/utils/math/Math.sol";
+import {ReentrancyGuardTransient} from "@openzeppelin/contracts/utils/ReentrancyGuardTransient.sol";
 import {IPoolManager} from "@uniswap/v4-core/src/interfaces/IPoolManager.sol";
 import {IHooks} from "@uniswap/v4-core/src/interfaces/IHooks.sol";
+import {FullMath} from "@uniswap/v4-core/src/libraries/FullMath.sol";
 import {Currency} from "@uniswap/v4-core/src/types/Currency.sol";
 import {PoolKey} from "@uniswap/v4-core/src/types/PoolKey.sol";
 import {PoolId} from "@uniswap/v4-core/src/types/PoolId.sol";
@@ -17,7 +22,14 @@ import {IOathVault} from "./interfaces/IOathVault.sol";
 ///         counterfactual (MATH.md §6, §9). Created only by `OathFactory`, which also creates its pool.
 /// @dev Pool key and parameters are fixed at creation and held as immutables. Values are in raw currency1 units
 ///      (MATH.md §1).
-contract OathVault is ERC20 {
+contract OathVault is ERC20, ReentrancyGuardTransient {
+    using SafeERC20 for IERC20;
+
+    /// @notice Shares minted to `DEAD` on the first deposit, so the share price cannot be inflated (MATH.md §11).
+    uint256 public constant MIN_SHARES = 1_000;
+    /// @notice Holder of the permanently locked `MIN_SHARES`.
+    address public constant DEAD = 0x000000000000000000000000000000000000dEaD;
+
     IPoolManager private immutable MANAGER;
     IOathHook private immutable HOOK;
     address private immutable FACTORY;
@@ -39,6 +51,15 @@ contract OathVault is ERC20 {
     uint16 private immutable MIN_BOND_BPS;
     uint16 private immutable CAP_BPS;
 
+    /// @notice Current lifecycle state. Deposits and withdrawals happen only while OPEN.
+    /// @dev OPEN (the zero value) until `startEpoch` exists to move it to ACTIVE.
+    // forge-lint: disable-next-line(uninitialized-state)
+    IOathVault.State public state;
+    /// @notice Currency1 held as the curator's bond. Part of the vault's currency1 balance, but not of `idle1`
+    ///         or of NAV.
+    /// @dev Zero until `postBond` exists to write it.
+    // forge-lint: disable-next-line(uninitialized-state)
+    uint256 public bondBalance;
     /// @notice Open-window start `T0`: when the current open window began.
     uint32 public openSince;
     /// @notice The hook's tick cumulative at `T0`, the start of the open-window TWAP (MATH.md §5).
@@ -81,18 +102,73 @@ contract OathVault is ERC20 {
         CAP_BPS = params_.capBps;
     }
 
+    // ---------------------------------------------------------------- shares
+
+    /// @notice Deposits in kind during the open window and mints shares to `receiver` (MATH.md §11). Price-free:
+    ///         - first deposit: `shares = sqrt(a0·a1) − MIN_SHARES`, `MIN_SHARES` minted to `DEAD`, both amounts
+    ///           taken in full;
+    ///         - later deposits: `shares = min_i mulDiv(supply, a_i, h_i)` over the tokens the vault holds
+    ///           (`h_i > 0`), and `used_i = mulDivUp(h_i, shares, supply)` is taken; the rest is not.
+    /// @dev Holdings `h_i` are the idle balances before this deposit (bond excluded). Shares round down and taken
+    ///      amounts round up, so rounding favours the vault. `a0·a1` must fit in 256 bits.
+    ///      Reverts `NotOpen()`, `BadNativeAmount()`, `ZeroShares()`, `EmptyVault()`, `Slippage()`.
+    /// @param amount0Max Maximum currency0 to deposit.
+    /// @param amount1Max Maximum currency1 to deposit.
+    /// @param minShares Minimum shares to mint, else `Slippage()`.
+    /// @param receiver Receiver of the shares.
+    /// @return shares Shares minted to `receiver`.
+    /// @return used0 Currency0 taken.
+    /// @return used1 Currency1 taken.
+    function deposit(uint256 amount0Max, uint256 amount1Max, uint256 minShares, address receiver)
+        external
+        payable
+        nonReentrant
+        returns (uint256 shares, uint256 used0, uint256 used1)
+    {
+        if (state != IOathVault.State.OPEN) revert IOathVault.NotOpen();
+        if (msg.value != 0) revert IOathVault.BadNativeAmount();
+
+        uint256 supply = totalSupply();
+        if (supply == 0) {
+            if (amount0Max == 0 || amount1Max == 0) revert IOathVault.ZeroShares();
+            uint256 root = Math.sqrt(amount0Max * amount1Max);
+            if (root <= MIN_SHARES) revert IOathVault.ZeroShares();
+            shares = root - MIN_SHARES;
+            (used0, used1) = (amount0Max, amount1Max);
+            _mint(DEAD, MIN_SHARES);
+        } else {
+            (shares, used0, used1) = _proportional(supply, amount0Max, amount1Max, idle0(), idle1());
+        }
+        if (shares < minShares) revert IOathVault.Slippage();
+
+        if (used0 != 0) IERC20(Currency.unwrap(CURRENCY0)).safeTransferFrom(msg.sender, address(this), used0);
+        if (used1 != 0) IERC20(Currency.unwrap(CURRENCY1)).safeTransferFrom(msg.sender, address(this), used1);
+        _mint(receiver, shares);
+        emit IOathVault.Deposit(msg.sender, receiver, used0, used1, shares);
+    }
+
     // ---------------------------------------------------------------- open window
 
     /// @notice Starts the first open window right after pool initialization: `T0 = now`,
     ///         `cumAtOpen = hook.cumulativeNow(key)`. Factory only, once.
     /// @dev Reverts `OnlyFactory()` or `AlreadyInitialized()`.
-    function initOpenWindow() external {
+    function initOpenWindow() external nonReentrant {
         if (msg.sender != FACTORY) revert IOathVault.OnlyFactory();
         if (openSince != 0) revert IOathVault.AlreadyInitialized();
         _startOpenWindow();
     }
 
     // ---------------------------------------------------------------- views
+
+    /// @notice Idle currency0: the vault's currency0 balance (its ETH balance if currency0 is native).
+    function idle0() public view returns (uint256) {
+        return CURRENCY0.balanceOfSelf();
+    }
+
+    /// @notice Idle currency1: the vault's currency1 balance minus the bond.
+    function idle1() public view returns (uint256) {
+        return CURRENCY1.balanceOfSelf() - bondBalance;
+    }
 
     /// @notice The Uniswap v4 PoolManager.
     function manager() external view returns (IPoolManager) {
@@ -146,6 +222,23 @@ contract OathVault is ERC20 {
     }
 
     // ---------------------------------------------------------------- internal
+
+    /// @dev A later deposit priced against holdings `(h0, h1)` (MATH.md §11): `shares = min_i mulDiv(supply, a_i,
+    ///      h_i)` over tokens with `h_i > 0`, `used_i = mulDivUp(h_i, shares, supply) ≤ a_i`. Reverts `EmptyVault()`
+    ///      if the vault holds neither token, `ZeroShares()` if the deposit is too small for one share.
+    function _proportional(uint256 supply, uint256 a0, uint256 a1, uint256 h0, uint256 h1)
+        private
+        pure
+        returns (uint256 shares, uint256 used0, uint256 used1)
+    {
+        if (h0 == 0 && h1 == 0) revert IOathVault.EmptyVault();
+        shares = type(uint256).max;
+        if (h0 != 0) shares = FullMath.mulDiv(supply, a0, h0);
+        if (h1 != 0) shares = Math.min(shares, FullMath.mulDiv(supply, a1, h1));
+        if (shares == 0) revert IOathVault.ZeroShares();
+        used0 = FullMath.mulDivRoundingUp(h0, shares, supply);
+        used1 = FullMath.mulDivRoundingUp(h1, shares, supply);
+    }
 
     /// @dev Starts an open window at now: records `T0` and the hook's cumulative at `T0`.
     function _startOpenWindow() private {
