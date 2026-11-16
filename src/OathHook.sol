@@ -195,26 +195,53 @@ contract OathHook is BaseHook, IOathHook {
         return IHooks.beforeDonate.selector;
     }
 
-    /// @dev Other LPs are never restricted. The guard and vault range tracking are not wired in yet, so for
-    ///      now this only returns its selector.
-    function _beforeAddLiquidity(address, PoolKey calldata, ModifyLiquidityParams calldata, bytes calldata)
-        internal
-        pure
-        override
-        returns (bytes4)
-    {
+    /// @dev Other LPs are never restricted. When the pool's vault adds liquidity: the intra-block guard, then
+    ///      the range is recorded, so the boundary snapshot reads fee growth inside the vault's range.
+    function _beforeAddLiquidity(
+        address sender,
+        PoolKey calldata key,
+        ModifyLiquidityParams calldata params,
+        bytes calldata
+    ) internal override returns (bytes4) {
+        PoolId id = key.toId();
+        IOathHook.PoolConfig storage cfg = configs[id];
+        if (sender == cfg.vault) {
+            _guard(id, cfg.maxIntraBlockTicks);
+            cfg.vaultLower = params.tickLower;
+            cfg.vaultUpper = params.tickUpper;
+        }
         return IHooks.beforeAddLiquidity.selector;
     }
 
-    /// @dev Other LPs are never restricted. The guard is not wired in yet, so for now this only returns its
-    ///      selector.
-    function _beforeRemoveLiquidity(address, PoolKey calldata, ModifyLiquidityParams calldata, bytes calldata)
-        internal
-        pure
-        override
-        returns (bytes4)
-    {
+    /// @dev Other LPs are never restricted. When the pool's vault removes liquidity (or modifies it by zero):
+    ///      the intra-block guard.
+    function _beforeRemoveLiquidity(
+        address sender,
+        PoolKey calldata key,
+        ModifyLiquidityParams calldata,
+        bytes calldata
+    ) internal view override returns (bytes4) {
+        PoolId id = key.toId();
+        IOathHook.PoolConfig storage cfg = configs[id];
+        if (sender == cfg.vault) _guard(id, cfg.maxIntraBlockTicks);
         return IHooks.beforeRemoveLiquidity.selector;
+    }
+
+    /// @dev The intra-block manipulation guard on the vault's liquidity changes: reverts
+    ///      `PriceMovedThisBlock(current, blockStart)` if a swap earlier in this block moved the tick more than
+    ///      `maxIntraBlockTicks` away from where the block started. If no swap has happened in this block, the
+    ///      current tick is the block-start tick (only swaps move the price) and the check passes. This blocks a
+    ///      sandwich of the vault's reposition or unwind within one block, and bounds the price impact of the
+    ///      curator's own rebalance swap.
+    function _guard(PoolId id, int24 maxIntraBlockTicks) private view {
+        IOathHook.Oracle storage o = oracles[id];
+        if (o.lastSwapBlock != block.number) return;
+        (, int24 tick,,) = poolManager.getSlot0(id);
+        int24 blockStart = o.blockStartTick;
+        int256 moved = int256(tick) - int256(blockStart);
+        if (moved > maxIntraBlockTicks || moved < -int256(maxIntraBlockTicks)) {
+            revert IOathHook.PriceMovedThisBlock(tick, blockStart);
+        }
     }
 
     /// @dev Records the epoch's due checkpoints and boundary snapshot, then advances the pool's accumulator to
