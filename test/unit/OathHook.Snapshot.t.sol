@@ -76,6 +76,132 @@ contract OathHookSnapshotTest is OathHookTestBase {
         assertGt(g0Now, first.G0, "fee growth moved on");
     }
 
+    /// @dev Fees earned in the final TWAP window `[E − W, E)`, after checkpoint A is recorded, are in the
+    ///      snapshot: it is taken at `E`, not at `E − W`.
+    function test_snapshot_includesFeesUpToE() public {
+        _tradeDuringEpoch();
+        vm.warp(epochEnd - 10 minutes);
+        _moveToTick(START_TICK + 1_500);
+        assertTrue(hook.epochData(key).doneA, "checkpoint A recorded");
+        vm.warp(epochEnd - 1);
+        _moveToTick(START_TICK - 1_500);
+        Growth memory atE = _growthNow();
+
+        vm.warp(epochEnd + 1);
+        hook.poke(key);
+        _assertSnapshot(hook.epochData(key), atE);
+    }
+
+    // ---------------------------------------------------------------- exactness across paths
+
+    /// @dev From the same state after `E`, a swap, a donation and a poke store the identical epoch record, equal
+    ///      to the fee growth at `E`.
+    function test_snapshot_identicalViaSwapDonateAndPoke() public {
+        _tradeDuringEpoch();
+        vm.warp(epochEnd + 1 hours);
+        Growth memory atE = _growthNow();
+        uint256 snap = vm.snapshotState();
+
+        hook.poke(key);
+        bytes memory viaPoke = abi.encode(hook.epochData(key));
+
+        vm.revertToState(snap);
+        donateRouter.donate(key, 1e15, 1e12, ZERO_BYTES);
+        bytes memory viaDonate = abi.encode(hook.epochData(key));
+
+        vm.revertToState(snap);
+        _moveToTick(START_TICK + 2_000);
+        bytes memory viaSwap = abi.encode(hook.epochData(key));
+
+        assertEq(viaDonate, viaPoke, "donate == poke");
+        assertEq(viaSwap, viaPoke, "swap == poke");
+        _assertSnapshot(abi.decode(viaPoke, (IOathHook.Epoch)), atE);
+    }
+
+    /// @dev The first swap after `E` earns fees, but the snapshot is taken before it trades.
+    function test_snapshot_excludesFirstPostESwapFees() public {
+        _tradeDuringEpoch();
+        vm.warp(epochEnd + 1);
+        Growth memory atE = _growthNow();
+
+        _moveToTick(START_TICK + 2_000); // zeroForOne = false: currency1 fees
+        _moveToTick(START_TICK - 2_000); // same block, other way: currency0 fees
+        IOathHook.Epoch memory e = hook.epochData(key);
+        _assertSnapshot(e, atE);
+        Growth memory after_ = _growthNow();
+        assertGt(after_.g0, e.G0, "post-E currency0 fees excluded");
+        assertGt(after_.g1, e.G1, "post-E currency1 fees excluded");
+    }
+
+    /// @dev A donation as the first action after `E` is excluded: `beforeDonate` snapshots before it lands.
+    function test_snapshot_excludesPostEDonation() public {
+        _tradeDuringEpoch();
+        vm.warp(epochEnd + 1);
+        Growth memory atE = _growthNow();
+
+        donateRouter.donate(key, 1e18, 1e18, ZERO_BYTES);
+        IOathHook.Epoch memory e = hook.epochData(key);
+        _assertSnapshot(e, atE);
+        Growth memory after_ = _growthNow();
+        assertGt(after_.g0, e.G0, "donation excluded (currency0)");
+        assertGt(after_.g1, e.G1, "donation excluded (currency1)");
+    }
+
+    /// @dev The whole epoch record (both checkpoints and the snapshot) is the same whether or not anything
+    ///      happens between `E` and the record being read.
+    function test_snapshot_sameWithOrWithoutPostEActivity() public {
+        _tradeDuringEpoch();
+        uint256 snap = vm.snapshotState();
+
+        vm.warp(epochEnd + 3 hours);
+        hook.poke(key);
+        bytes memory quiet = abi.encode(hook.epochData(key));
+
+        vm.revertToState(snap);
+        vm.warp(epochEnd);
+        _moveToTick(START_TICK + 5_000);
+        _nextBlock(1 hours);
+        donateRouter.donate(key, 1e18, 1e18, ZERO_BYTES);
+        _nextBlock(1 hours);
+        _moveToTick(START_TICK - 5_000);
+        _nextBlock(1 hours);
+        hook.poke(key);
+        bytes memory busy = abi.encode(hook.epochData(key));
+
+        assertEq(busy, quiet, "post-E activity changes nothing");
+    }
+
+    /// @dev For any history of swaps, donations and liquidity changes during the epoch, a snapshot taken by any
+    ///      path at any time after `E` equals the fee growth read directly after the last action before `E`.
+    function testFuzz_snapshot_equalsGrowthAtE(uint256 seed) public {
+        for (uint256 i; i < 12; i++) {
+            uint256 r = uint256(keccak256(abi.encode(seed, i)));
+            _nextBlock(1 + (r >> 8) % 2 hours); // 12 steps of at most 2 h stay inside the 1-day epoch
+            uint256 action = (r >> 64) % 4;
+            if (action <= 1) {
+                _moveToTick(START_TICK + int24(int256((r >> 96) % 10_001)) - 5_000);
+            } else if (action == 2) {
+                donateRouter.donate(key, 1 + (r >> 96) % 1e15, 1 + (r >> 160) % 1e12, ZERO_BYTES);
+            } else {
+                modifyLiquidityRouter.modifyLiquidity(key, LIQUIDITY_PARAMS, ZERO_BYTES);
+                modifyLiquidityRouter.modifyLiquidity(key, REMOVE_LIQUIDITY_PARAMS, ZERO_BYTES);
+            }
+        }
+        assertLt(_time(), epochEnd, "history stayed before E");
+        // A last trade one second before E, inside the final window.
+        vm.warp(epochEnd - 1);
+        _moveToTick(START_TICK + int24(int256(seed % 4_001)) - 2_000);
+        Growth memory atE = _growthNow();
+
+        vm.warp(epochEnd + seed % 2 days);
+        uint256 path = (seed >> 128) % 3;
+        if (path == 0) _moveToTick(START_TICK + 7_000);
+        else if (path == 1) donateRouter.donate(key, 1e15, 1e12, ZERO_BYTES);
+        else hook.poke(key);
+
+        _assertSnapshot(hook.epochData(key), atE);
+    }
+
     // ---------------------------------------------------------------- closing and reopening
 
     /// @dev Once both checkpoints and the snapshot are in, the vault can close the epoch; after that nothing is
