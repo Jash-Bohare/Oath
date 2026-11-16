@@ -15,6 +15,7 @@ import {SwapParams} from "@uniswap/v4-core/src/types/PoolOperation.sol";
 import {PoolSwapTest} from "@uniswap/v4-core/src/test/PoolSwapTest.sol";
 import {IOathHook} from "../../src/interfaces/IOathHook.sol";
 import {IOathVault} from "../../src/interfaces/IOathVault.sol";
+import {OathFactory} from "../../src/OathFactory.sol";
 
 /// @notice The exact permission set of OathHook; everything else, including every
 ///         `*ReturnsDelta` flag, is false.
@@ -67,6 +68,17 @@ abstract contract OathTestBase is Deployers {
     /// @notice Deploys `OathHook(manager, factory)` at the flagged address.
     function _deployOathHook(address factory) internal returns (IOathHook) {
         return IOathHook(_deployHookAt("OathHook.sol:OathHook", abi.encode(manager, factory)));
+    }
+
+    /// @notice Deploys the real hook-and-factory pair: the hook (at `HOOK_ADDRESS`) for a factory at a fixed
+    ///         address, then the factory there, whose constructor checks `hook.factory() == address(this)`.
+    /// @dev Both use `deployCodeTo`, so no address prediction depends on this contract's nonce (which
+    ///      `deployCodeTo` itself advances). The deploy script predicts the factory's CREATE address instead.
+    function _deployOathStack() internal returns (IOathHook hook, OathFactory factory) {
+        address factoryAddress = makeAddr("OathFactory");
+        hook = _deployOathHook(factoryAddress);
+        deployCodeTo("OathFactory.sol:OathFactory", abi.encode(manager, hook), factoryAddress);
+        factory = OathFactory(factoryAddress);
     }
 
     /// @notice A pool key for `c0`/`c1` with the demo fee and tick spacing and the hook at `HOOK_ADDRESS`.
