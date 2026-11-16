@@ -3,7 +3,9 @@ pragma solidity 0.8.26;
 
 import {IPoolManager} from "@uniswap/v4-core/src/interfaces/IPoolManager.sol";
 import {StateLibrary} from "@uniswap/v4-core/src/libraries/StateLibrary.sol";
+import {BalanceDelta} from "@uniswap/v4-core/src/types/BalanceDelta.sol";
 import {IOathHook} from "../../src/interfaces/IOathHook.sol";
+import {ValuationLib} from "../../src/libraries/ValuationLib.sol";
 import {OathHookTestBase} from "../utils/OathHookTestBase.sol";
 
 /// @notice OathHook's keeperless epoch-boundary snapshot (MATH.md §8) on the real PoolManager: global fee growth
@@ -255,5 +257,63 @@ contract OathHookSnapshotTest is OathHookTestBase {
         assertEq(e.G1, g.g1, "G1");
         assertEq(e.fgIn0, g.in0, "fgIn0");
         assertEq(e.fgIn1, g.in1, "fgIn1");
+    }
+}
+
+/// @notice The snapshot with a real vault position: fee growth inside the range the vault recorded, so the vault's
+///         uncollected fees at `E` (MATH.md §7) are exactly what a withdrawal at `E` pays.
+contract OathHookSnapshotVaultRangeTest is OathHookTestBase {
+    using StateLibrary for IPoolManager;
+
+    int24 internal constant LOWER = -199400;
+    int24 internal constant UPPER = -199000;
+
+    uint32 internal epochEnd;
+
+    function setUp() public override {
+        super.setUp();
+        _useVaultRouter();
+        _createPool(START_TICK);
+        epochEnd = uint32(_time() + 1 days);
+        _openEpoch(epochEnd, 30 minutes);
+    }
+
+    /// @dev The vault's position earns fees through swaps inside, across and outside its range and a donation.
+    ///      At `E` the snapshot's fee growth inside the vault's range, with the position's last marks, gives fees
+    ///      that, with the principal at the end price, equal a real withdrawal to the wei.
+    function test_snapshot_vaultFeesAtEMatchRealWithdrawal() public {
+        _vaultModify(LOWER, UPPER, 1e20);
+        _nextBlock(1 hours);
+        _moveToTick(START_TICK + 150); // inside the range
+        _nextBlock(1 hours);
+        _moveToTick(START_TICK - 350); // below the range: crosses its lower tick
+        _nextBlock(1 hours);
+        _moveToTick(START_TICK + 100); // back inside
+        donateRouter.donate(key, 1e12, 1e9, ZERO_BYTES);
+
+        vm.warp(epochEnd + 1);
+        vm.roll(_block() + 1);
+        hook.poke(key);
+        IOathHook.Epoch memory e = hook.epochData(key);
+
+        (,, int24 vaultLower, int24 vaultUpper) = hook.configs(id);
+        assertEq(vaultLower, LOWER, "recorded lower");
+        assertEq(vaultUpper, UPPER, "recorded upper");
+        (uint256 in0, uint256 in1) = manager.getFeeGrowthInside(id, LOWER, UPPER);
+        assertEq(e.fgIn0, in0, "fgIn0 is the vault range's");
+        assertEq(e.fgIn1, in1, "fgIn1 is the vault range's");
+
+        (uint128 liquidity, uint256 last0, uint256 last1) =
+            manager.getPositionInfo(id, address(vaultRouter), LOWER, UPPER, bytes32(0));
+        uint256 fees0 = ValuationLib.feesOwed(liquidity, last0, e.fgIn0);
+        uint256 fees1 = ValuationLib.feesOwed(liquidity, last1, e.fgIn1);
+        assertGt(fees0, 0, "currency0 fees");
+        assertGt(fees1, 0, "currency1 fees");
+        (uint160 sqrtPriceX96,,,) = manager.getSlot0(id);
+        (uint256 p0, uint256 p1) = ValuationLib.principal(liquidity, LOWER, UPPER, sqrtPriceX96);
+
+        BalanceDelta out = _vaultModify(LOWER, UPPER, -int256(uint256(liquidity)));
+        assertEq(uint256(int256(out.amount0())), p0 + fees0, "currency0: principal + fees, to the wei");
+        assertEq(uint256(int256(out.amount1())), p1 + fees1, "currency1: principal + fees, to the wei");
     }
 }
