@@ -1,8 +1,6 @@
 // SPDX-License-Identifier: MIT
 pragma solidity 0.8.26;
 
-import {IPoolManager} from "@uniswap/v4-core/src/interfaces/IPoolManager.sol";
-import {StateLibrary} from "@uniswap/v4-core/src/libraries/StateLibrary.sol";
 import {TickMath} from "@uniswap/v4-core/src/libraries/TickMath.sol";
 import {PoolId} from "@uniswap/v4-core/src/types/PoolId.sol";
 import {IHooks} from "@uniswap/v4-core/src/interfaces/IHooks.sol";
@@ -10,30 +8,10 @@ import {ModifyLiquidityParams, SwapParams} from "@uniswap/v4-core/src/types/Pool
 import {IOathHook} from "../../src/interfaces/IOathHook.sol";
 import {OathHook} from "../../src/OathHook.sol";
 import {OathTestBase} from "../utils/OathTestBase.sol";
+import {OathHookTestBase} from "../utils/OathHookTestBase.sol";
 
-/// @notice OathHook's exact TWAP accumulator (MATH.md §4) on the real PoolManager.
-contract OathHookOracleTest is OathTestBase {
-    using StateLibrary for IPoolManager;
-
-    /// @dev The demo pool's start tick on the Nov 8 mainnet fork ($2,235.94 per ETH, MATH.md §9.1).
-    int24 internal constant START_TICK = -199196;
-    /// @dev Full-range liquidity deep enough to move the price anywhere the tests need.
-    uint256 internal constant DEPTH = 1e24;
-
-    address internal factory = makeAddr("factory");
-    address internal vault = makeAddr("vault");
-
-    OathHook internal hook;
-    PoolId internal id;
-    uint32 internal createdAt;
-
-    function setUp() public override {
-        super.setUp();
-        hook = OathHook(address(_deployOathHook(factory)));
-        key = _oathKey(currency0, currency1);
-        id = key.toId();
-    }
-
+/// @notice OathHook's exact TWAP accumulator and epoch checkpoints (MATH.md §4) on the real PoolManager.
+contract OathHookOracleTest is OathHookTestBase {
     // ---------------------------------------------------------------- start
 
     function test_oracle_initializeStartsAccumulator() public {
@@ -460,61 +438,6 @@ contract OathHookOracleTest is OathTestBase {
     }
 
     // ---------------------------------------------------------------- helpers
-
-    /// @dev Registers the vault, creates the pool through the factory at `tick`, and adds deep full-range
-    ///      liquidity.
-    function _createPool(int24 tick) internal {
-        vm.prank(factory);
-        hook.registerVault(key, vault, 50);
-        _initializeAt(tick);
-        (int24 tickMin, int24 tickMax) = _fullRange();
-        modifyLiquidityRouter.modifyLiquidity(
-            key,
-            ModifyLiquidityParams({
-                tickLower: tickMin, tickUpper: tickMax, liquidityDelta: int256(DEPTH), salt: bytes32(0)
-            }),
-            ZERO_BYTES
-        );
-    }
-
-    /// @dev Live block values. Under via_ir the optimizer may treat `block.timestamp` and `block.number` as
-    ///      constant within the test's transaction, so after `vm.warp`/`vm.roll` read them through the cheatcodes.
-    function _time() internal view returns (uint256) {
-        return vm.getBlockTimestamp();
-    }
-
-    function _block() internal view returns (uint256) {
-        return vm.getBlockNumber();
-    }
-
-    function _wait(uint256 dt) internal {
-        vm.warp(_time() + dt);
-    }
-
-    function _nextBlock(uint256 dt) internal {
-        vm.roll(_block() + 1);
-        vm.warp(_time() + dt);
-    }
-
-    function _openEpoch(uint32 epochEnd, uint32 twapWindow) internal {
-        vm.prank(vault);
-        hook.openEpoch(key, epochEnd, twapWindow);
-    }
-
-    function _initializeAt(int24 tick) internal {
-        vm.prank(factory);
-        manager.initialize(key, TickMath.getSqrtPriceAtTick(tick));
-        createdAt = uint32(_time());
-        assertEq(_tick(), tick, "created at tick");
-    }
-
-    function _moveToTick(int24 tick) internal {
-        _moveTo(key, TickMath.getSqrtPriceAtTick(tick));
-    }
-
-    function _tick() internal view returns (int24 tick) {
-        (, tick,,) = manager.getSlot0(id);
-    }
 
     function _assertOracle(int256 tickCumulative, uint32 lastTimestamp) internal view {
         (uint32 ts,,, int256 cum) = hook.oracles(id);
