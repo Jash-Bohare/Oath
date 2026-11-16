@@ -147,6 +147,34 @@ contract OathVault is ERC20, ReentrancyGuardTransient {
         emit IOathVault.Deposit(msg.sender, receiver, used0, used1, shares);
     }
 
+    /// @notice Burns `shares` from the caller for a pro-rata share of both idle currencies during the open window,
+    ///         sent to `receiver`: `out_i = mulDiv(h_i, shares, supply)` (MATH.md §11). The bond is not part of
+    ///         the holdings.
+    /// @dev Rounds down, in the vault's favour. Reverts `NotOpen()`, `Slippage()`, or the ERC-20 balance error if
+    ///      the caller holds fewer than `shares`.
+    /// @param shares Shares to burn from the caller.
+    /// @param min0 Minimum currency0 out, else `Slippage()`.
+    /// @param min1 Minimum currency1 out, else `Slippage()`.
+    /// @param receiver Receiver of the currencies.
+    /// @return out0 Currency0 sent.
+    /// @return out1 Currency1 sent.
+    function withdraw(uint256 shares, uint256 min0, uint256 min1, address receiver)
+        external
+        nonReentrant
+        returns (uint256 out0, uint256 out1)
+    {
+        if (state != IOathVault.State.OPEN) revert IOathVault.NotOpen();
+        uint256 supply = totalSupply();
+        out0 = FullMath.mulDiv(idle0(), shares, supply);
+        out1 = FullMath.mulDiv(idle1(), shares, supply);
+        if (out0 < min0 || out1 < min1) revert IOathVault.Slippage();
+
+        _burn(msg.sender, shares);
+        emit IOathVault.Withdraw(msg.sender, receiver, out0, out1, shares);
+        if (out0 != 0) CURRENCY0.transfer(receiver, out0);
+        if (out1 != 0) CURRENCY1.transfer(receiver, out1);
+    }
+
     // ---------------------------------------------------------------- open window
 
     /// @notice Starts the first open window right after pool initialization: `T0 = now`,

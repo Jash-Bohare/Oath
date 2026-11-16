@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: MIT
 pragma solidity 0.8.26;
 
+import {IERC20Errors} from "@openzeppelin/contracts/interfaces/draft-IERC6093.sol";
 import {IOathVault} from "../../src/interfaces/IOathVault.sol";
 import {OathVaultTestBase} from "../utils/OathVaultTestBase.sol";
 
@@ -161,6 +162,91 @@ contract OathVaultSharesTest is OathVaultTestBase {
             assertLe(shares * vault.idle1() / supply, used1, "claim1 <= used1");
         } catch (bytes memory reason) {
             assertEq(bytes4(reason), IOathVault.ZeroShares.selector, "only a too-small deposit fails");
+        }
+    }
+
+    // ---------------------------------------------------------------- withdrawals
+
+    /// @dev `out_i = mulDiv(h_i, shares, supply)`, sent to the receiver; the shares are burned from the caller.
+    function test_shares_withdrawIsProRata() public {
+        _deposit(alice, 4e18, 9e18); // supply 6e18
+        uint256 shares = 2e18;
+        uint256 out0Expected = uint256(4e18) * shares / 6e18; // 1.333…e18, floored
+        uint256 out1Expected = uint256(9e18) * shares / 6e18; // 3e18
+        uint256 bob0 = _balance0(bob);
+        uint256 bob1 = _balance1(bob);
+
+        vm.expectEmit(true, true, false, true, address(vault));
+        emit IOathVault.Withdraw(alice, bob, out0Expected, out1Expected, shares);
+        vm.prank(alice);
+        (uint256 out0, uint256 out1) = vault.withdraw(shares, 0, 0, bob);
+
+        assertEq(out0, out0Expected, "out0");
+        assertEq(out1, out1Expected, "out1");
+        assertEq(_balance0(bob) - bob0, out0, "receiver got currency0");
+        assertEq(_balance1(bob) - bob1, out1, "receiver got currency1");
+        assertEq(vault.balanceOf(alice), 6e18 - 1_000 - shares, "burned from caller");
+        assertEq(vault.totalSupply(), 4e18);
+        assertEq(vault.idle0(), 4e18 - out0);
+        assertEq(vault.idle1(), 9e18 - out1);
+    }
+
+    /// @dev When every withdrawable share is redeemed, only the dead shares' part stays behind.
+    function test_shares_withdrawAllLeavesOnlyDeadShare() public {
+        _deposit(alice, 1e18, 1e18); // supply 1e18
+        uint256 aliceShares = vault.balanceOf(alice);
+        vm.prank(alice);
+        vault.withdraw(aliceShares, 0, 0, alice);
+        assertEq(vault.totalSupply(), vault.MIN_SHARES());
+        assertEq(vault.idle0(), 1_000, "dead share's currency0");
+        assertEq(vault.idle1(), 1_000, "dead share's currency1");
+    }
+
+    function test_shares_withdrawSlippage() public {
+        _deposit(alice, 1e18, 1e18);
+        vm.startPrank(alice);
+        vm.expectRevert(IOathVault.Slippage.selector);
+        vault.withdraw(1e17, 1e17 + 1, 0, alice);
+        vm.expectRevert(IOathVault.Slippage.selector);
+        vault.withdraw(1e17, 0, 1e17 + 1, alice);
+        (uint256 out0, uint256 out1) = vault.withdraw(1e17, 1e17, 1e17, alice);
+        vm.stopPrank();
+        assertEq(out0, 1e17);
+        assertEq(out1, 1e17);
+    }
+
+    /// @dev Nobody can burn shares they do not hold.
+    function test_shares_withdrawMoreThanHeldReverts() public {
+        _deposit(alice, 1e18, 1e18);
+        uint256 held = vault.balanceOf(alice);
+        vm.prank(alice);
+        vm.expectRevert(abi.encodeWithSelector(IERC20Errors.ERC20InsufficientBalance.selector, alice, held, held + 1));
+        vault.withdraw(held + 1, 0, 0, alice);
+
+        vm.prank(bob);
+        vm.expectRevert(abi.encodeWithSelector(IERC20Errors.ERC20InsufficientBalance.selector, bob, 0, 1));
+        vault.withdraw(1, 0, 0, bob);
+    }
+
+    /// @dev A deposit followed by withdrawing the same shares returns what was taken, less at most 1 wei per
+    ///      currency (MATH.md §11 rounding), and never more.
+    function testFuzz_shares_depositWithdrawRoundTrip(uint256 h0, uint256 h1, uint256 a0, uint256 a1) public {
+        h0 = bound(h0, 1e6, 1e27);
+        h1 = bound(h1, 1e6, 1e27);
+        a0 = bound(a0, 1, 1e27);
+        a1 = bound(a1, 1, 1e27);
+        _deposit(alice, h0, h1);
+
+        vm.prank(bob);
+        try vault.deposit(a0, a1, 0, bob) returns (uint256 shares, uint256 used0, uint256 used1) {
+            vm.prank(bob);
+            (uint256 out0, uint256 out1) = vault.withdraw(shares, 0, 0, bob);
+            assertLe(out0, used0, "no profit in currency0");
+            assertLe(out1, used1, "no profit in currency1");
+            assertGe(out0 + 1, used0, "loses at most 1 wei of currency0");
+            assertGe(out1 + 1, used1, "loses at most 1 wei of currency1");
+        } catch (bytes memory reason) {
+            assertEq(bytes4(reason), IOathVault.ZeroShares.selector);
         }
     }
 }
