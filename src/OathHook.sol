@@ -121,8 +121,9 @@ contract OathHook is BaseHook, IOathHook {
         emit IOathHook.EpochClosed(id);
     }
 
-    /// @notice Advances the accumulator to now and records any checkpoint that has come due (MATH.md §4).
-    ///         Anyone, any time: it only records what the pool already did, so it cannot change any result.
+    /// @notice Advances the accumulator to now and records any checkpoint and the epoch-boundary snapshot that
+    ///         have come due (MATH.md §4, §8). Anyone, any time: it only records what the pool already did, so
+    ///         it cannot change any result.
     /// @param key The pool key.
     function poke(PoolKey calldata key) external {
         _advance(key);
@@ -183,7 +184,8 @@ contract OathHook is BaseHook, IOathHook {
         return (IHooks.beforeSwap.selector, BeforeSwapDeltaLibrary.ZERO_DELTA, 0);
     }
 
-    /// @dev Observes donations without changing them; advances the accumulator.
+    /// @dev Observes donations without changing them; advances the accumulator. Runs before the donation
+    ///      raises fee growth, so a snapshot taken here excludes it (MATH.md §8).
     function _beforeDonate(address, PoolKey calldata key, uint256, uint256, bytes calldata)
         internal
         override
@@ -215,7 +217,8 @@ contract OathHook is BaseHook, IOathHook {
         return IHooks.beforeRemoveLiquidity.selector;
     }
 
-    /// @dev Records the epoch's due checkpoints, then advances the pool's accumulator to now (MATH.md §4):
+    /// @dev Records the epoch's due checkpoints and boundary snapshot, then advances the pool's accumulator to
+    ///      now (MATH.md §4, §8):
     ///      `tickCumulative += tick·(now − lastTimestamp)`, `lastTimestamp = now`.
     ///      Exact: the tick only changes inside swaps, and every swap calls this before the price moves, so
     ///      the current tick held throughout `(lastTimestamp, now]`. A checkpoint `t*` in that interval is
@@ -241,10 +244,29 @@ contract OathHook is BaseHook, IOathHook {
                 e.cumB = _checkpoint(id, o, tick, e.checkpointB);
                 e.doneB = true;
             }
+            // forge-lint: disable-next-line(block-timestamp)
+            if (!e.snapTaken && e.checkpointB <= nowTs) _snapshot(id, e);
         }
 
         o.tickCumulative = _cumulativeAt(o.tickCumulative, o.lastTimestamp, tick, nowTs);
         o.lastTimestamp = nowTs;
+    }
+
+    /// @dev The keeperless boundary snapshot (MATH.md §8): global fee growth and the fee growth inside the
+    ///      vault's last range, read by the first advance at or after `E`. Exact: fee growth only changes in
+    ///      swaps and donations (and inside a range also through tick crossings, which happen only in swaps),
+    ///      and their `before*` callbacks run this before they change anything, so the current values are
+    ///      the values at `E`.
+    function _snapshot(PoolId id, IOathHook.Epoch storage e) private {
+        (uint256 g0, uint256 g1) = poolManager.getFeeGrowthGlobals(id);
+        IOathHook.PoolConfig storage cfg = configs[id];
+        (uint256 in0, uint256 in1) = poolManager.getFeeGrowthInside(id, cfg.vaultLower, cfg.vaultUpper);
+        e.G0 = g0;
+        e.G1 = g1;
+        e.fgIn0 = in0;
+        e.fgIn1 = in1;
+        e.snapTaken = true;
+        emit IOathHook.EpochSnapshot(id, g0, g1, in0, in1);
     }
 
     /// @dev The cumulative at checkpoint `t` (MATH.md §4): `tick` held throughout `(lastTimestamp, now]` and

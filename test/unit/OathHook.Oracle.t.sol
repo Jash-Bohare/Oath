@@ -509,6 +509,19 @@ contract OathHookSwapGasTest is OathTestBase {
         emit log_named_uint("beforeSwap gas, cold, first swap of block", _beforeSwapGas());
     }
 
+    /// @dev Reported, not bounded: the first swap at or after `E` records both checkpoints and the boundary
+    ///      snapshot (two fee-growth reads), warm.
+    /// forge-config: default.isolate = false
+    function test_gas_beforeSwapCheckpointsAndSnapshotDueReport() public {
+        vm.warp(vm.getBlockTimestamp() + 7 days);
+        hook.oracles(id);
+        hook.cumulativeNow(key);
+        hook.epochData(key);
+        uint256 used = _beforeSwapGas();
+        assertTrue(hook.epochData(key).snapTaken, "snapshot taken");
+        emit log_named_uint("beforeSwap gas, warm, checkpoints A and B and snapshot due", used);
+    }
+
     /// @dev Gas of one `beforeSwap` call made as the PoolManager makes it, from pre-encoded calldata. Includes the
     ///      `CALL` itself, so it slightly overstates the hook's own cost.
     function _beforeSwapGas() internal returns (uint256 used) {
