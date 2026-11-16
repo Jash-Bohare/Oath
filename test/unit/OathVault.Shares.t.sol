@@ -253,6 +253,104 @@ contract OathVaultSharesTest is OathVaultTestBase {
             assertEq(bytes4(reason), IOathVault.ZeroShares.selector);
         }
     }
+
+    // ---------------------------------------------------------------- inflation attack (T9)
+
+    /// @dev The classic first-depositor attack: mint the minimum, then donate a fortune so later deposits round
+    ///      to nothing. The dead shares own 1,000 of every 1,001 shares, so the donation mostly goes to them; a
+    ///      small victim deposit reverts instead of minting zero shares; a large one pays only for the shares
+    ///      it gets and loses at most 1 wei per currency.
+    function test_inflationAttack_fails() public {
+        address attacker = makeAddr("attacker");
+        address victim = makeAddr("victim");
+        uint256 donation = 1e24;
+        _give(attacker, 1_001 + donation, 1_001 + donation);
+        _give(victim, 1e30, 1e30);
+        uint256 attacker0 = _balance0(attacker);
+        uint256 attacker1 = _balance1(attacker);
+
+        (uint256 attackerShares,,) = _deposit(attacker, 1_001, 1_001);
+        assertEq(attackerShares, 1, "one share, 1,000 locked");
+        vm.startPrank(attacker);
+        currency0.transfer(address(vault), donation);
+        currency1.transfer(address(vault), donation);
+        vm.stopPrank();
+
+        // A small victim deposit: too small for one share, so it reverts and takes nothing.
+        vm.prank(victim);
+        vm.expectRevert(IOathVault.ZeroShares.selector);
+        vault.deposit(1e18, 1e18, 0, victim);
+
+        // A large victim deposit: pays exactly for its shares and gets back all but at most 1 wei.
+        (uint256 victimShares, uint256 used0, uint256 used1) = _deposit(victim, 1e26, 1e26);
+        assertGt(victimShares, 0);
+        vm.prank(victim);
+        (uint256 out0, uint256 out1) = vault.withdraw(victimShares, 0, 0, victim);
+        assertGe(out0 + 1, used0, "victim loses at most 1 wei of currency0");
+        assertGe(out1 + 1, used1, "victim loses at most 1 wei of currency1");
+
+        // The attacker redeems its share and has lost almost the whole donation.
+        vm.prank(attacker);
+        vault.withdraw(attackerShares, 0, 0, attacker);
+        uint256 lost0 = attacker0 - _balance0(attacker);
+        uint256 lost1 = attacker1 - _balance1(attacker);
+        assertGe(lost0, donation * 999 / 1_000, "attacker lost >= 99.9% of the currency0 donation");
+        assertGe(lost1, donation * 999 / 1_000, "attacker lost >= 99.9% of the currency1 donation");
+    }
+
+    /// @dev Tokens sent to an empty vault belong to the first depositor (less the dead shares' part).
+    function test_shares_donationBeforeFirstDepositGoesToFirstDepositor() public {
+        vm.startPrank(bob);
+        currency0.transfer(address(vault), 5e18);
+        currency1.transfer(address(vault), 5e18);
+        vm.stopPrank();
+
+        (uint256 shares,,) = _deposit(alice, 1e18, 1e18); // supply 1e18, holdings 6e18 each
+        vm.prank(alice);
+        (uint256 out0, uint256 out1) = vault.withdraw(shares, 0, 0, alice);
+        assertEq(out0, uint256(6e18) * shares / 1e18, "currency0 incl. donation");
+        assertEq(out1, uint256(6e18) * shares / 1e18, "currency1 incl. donation");
+    }
+
+    // ---------------------------------------------------------------- properties over sequences
+
+    /// @dev Random deposits and withdrawals by three users. After every action: total supply is the sum of all
+    ///      balances (dead shares included), and holdings per share never fall, so nothing other depositors do
+    ///      can lower anyone's redeemable amounts (deposits round up what they take, withdrawals round down
+    ///      what they pay).
+    function testFuzz_shares_sequencesKeepSupplyAndShareValue(uint256 seed) public {
+        address carol = makeAddr("carol");
+        _give(carol, 1e30, 1e30);
+        address[3] memory users = [alice, bob, carol];
+        _deposit(alice, 1e18 + seed % 1e24, 1e18 + (seed >> 80) % 1e24);
+
+        for (uint256 i; i < 20; i++) {
+            uint256 r = uint256(keccak256(abi.encode(seed, i)));
+            address user = users[r % 3];
+            uint256 h0 = vault.idle0();
+            uint256 h1 = vault.idle1();
+            uint256 supply = vault.totalSupply();
+
+            if ((r >> 8) % 2 == 0) {
+                vm.prank(user);
+                try vault.deposit(1 + (r >> 16) % 1e24, 1 + (r >> 96) % 1e24, 0, user) {} catch {}
+            } else {
+                uint256 held = vault.balanceOf(user);
+                if (held == 0) continue;
+                vm.prank(user);
+                vault.withdraw(1 + (r >> 16) % held, 0, 0, user);
+            }
+
+            uint256 supplyAfter = vault.totalSupply();
+            assertEq(
+                supplyAfter,
+                vault.balanceOf(alice) + vault.balanceOf(bob) + vault.balanceOf(carol) + vault.balanceOf(vault.DEAD()),
+                "supply = sum of balances"
+            );
+            assertGe(vault.idle0() * supply, h0 * supplyAfter, "currency0 per share never falls");
+            assertGe(vault.idle1() * supply, h1 * supplyAfter, "currency1 per share never falls");
+        }
+    }
 }
 
 /// @notice Receives ETH from the vault and tries to re-enter it; records what the vault answered.
