@@ -121,8 +121,8 @@ contract OathHook is BaseHook, IOathHook {
         emit IOathHook.EpochClosed(id);
     }
 
-    /// @notice Advances the accumulator to now (MATH.md §4). Anyone, any time; it changes no result, it only
-    ///         records what the pool already did.
+    /// @notice Advances the accumulator to now and records any checkpoint that has come due (MATH.md §4).
+    ///         Anyone, any time: it only records what the pool already did, so it cannot change any result.
     /// @param key The pool key.
     function poke(PoolKey calldata key) external {
         _advance(key);
@@ -215,10 +215,11 @@ contract OathHook is BaseHook, IOathHook {
         return IHooks.beforeRemoveLiquidity.selector;
     }
 
-    /// @dev Advances the pool's accumulator to now (MATH.md §4):
+    /// @dev Records the epoch's due checkpoints, then advances the pool's accumulator to now (MATH.md §4):
     ///      `tickCumulative += tick·(now − lastTimestamp)`, `lastTimestamp = now`.
     ///      Exact: the tick only changes inside swaps, and every swap calls this before the price moves, so
-    ///      the current tick held throughout `(lastTimestamp, now]`.
+    ///      the current tick held throughout `(lastTimestamp, now]`. A checkpoint `t*` in that interval is
+    ///      therefore recorded exactly, not interpolated, and before the accumulator moves past it.
     /// @return id The pool id.
     /// @return tick The current tick, which held since `lastTimestamp`.
     function _advance(PoolKey calldata key) private returns (PoolId id, int24 tick) {
@@ -226,8 +227,37 @@ contract OathHook is BaseHook, IOathHook {
         (, tick,,) = poolManager.getSlot0(id);
         IOathHook.Oracle storage o = oracles[id];
         uint32 nowTs = _now();
+
+        IOathHook.Epoch storage e = epochs[id];
+        if (e.active) {
+            // Timestamp skew can only change which transaction records a checkpoint, never its value.
+            // forge-lint: disable-next-line(block-timestamp)
+            if (!e.doneA && e.checkpointA <= nowTs) {
+                e.cumA = _checkpoint(id, o, tick, e.checkpointA);
+                e.doneA = true;
+            }
+            // forge-lint: disable-next-line(block-timestamp)
+            if (!e.doneB && e.checkpointB <= nowTs) {
+                e.cumB = _checkpoint(id, o, tick, e.checkpointB);
+                e.doneB = true;
+            }
+        }
+
         o.tickCumulative = _cumulativeAt(o.tickCumulative, o.lastTimestamp, tick, nowTs);
         o.lastTimestamp = nowTs;
+    }
+
+    /// @dev The cumulative at checkpoint `t` (MATH.md §4): `tick` held throughout `(lastTimestamp, now]` and
+    ///      `lastTimestamp < t ≤ now`, so it is `tickCumulative + tick·(t − lastTimestamp)` exactly.
+    ///      `lastTimestamp < t` always holds: `openEpoch` schedules checkpoints strictly after the time it
+    ///      advances to, and a checkpoint is recorded by the first advance at or after it. Checked anyway.
+    function _checkpoint(PoolId id, IOathHook.Oracle storage o, int24 tick, uint32 t)
+        private
+        returns (int256 cumulative)
+    {
+        if (t <= o.lastTimestamp) revert IOathHook.CheckpointInPast();
+        cumulative = _cumulativeAt(o.tickCumulative, o.lastTimestamp, tick, t);
+        emit IOathHook.CheckpointRecorded(id, t, cumulative);
     }
 
     /// @dev The cumulative at time `t ≥ lastTimestamp` when `tick` held throughout `(lastTimestamp, t]`

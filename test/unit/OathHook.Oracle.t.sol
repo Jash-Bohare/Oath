@@ -7,6 +7,7 @@ import {TickMath} from "@uniswap/v4-core/src/libraries/TickMath.sol";
 import {PoolId} from "@uniswap/v4-core/src/types/PoolId.sol";
 import {IHooks} from "@uniswap/v4-core/src/interfaces/IHooks.sol";
 import {ModifyLiquidityParams, SwapParams} from "@uniswap/v4-core/src/types/PoolOperation.sol";
+import {IOathHook} from "../../src/interfaces/IOathHook.sol";
 import {OathHook} from "../../src/OathHook.sol";
 import {OathTestBase} from "../utils/OathTestBase.sol";
 
@@ -214,6 +215,178 @@ contract OathHookOracleTest is OathTestBase {
         _assertBlockStart(swapBlock, START_TICK);
     }
 
+    // ---------------------------------------------------------------- checkpoints
+
+    /// @dev Checkpoints are exact even when the first action after them comes hours later: A is recorded by a
+    ///      swap 3 h after it, B by a poke 4 h after the epoch end, each with the tick that held at its time.
+    function test_oracle_checkpointsExactWhenFirstActionIsHoursLater() public {
+        _createPool(START_TICK);
+        uint32 epochEnd = uint32(_time() + 1 days);
+        uint32 checkpointA = epochEnd - 6 hours;
+        _openEpoch(epochEnd, 6 hours);
+
+        _wait(2 hours);
+        _moveToTick(START_TICK + 400);
+        int24 t1 = _tick();
+        uint32 s1 = uint32(_time());
+        int256 cumS1 = int256(START_TICK) * int256(uint256(s1 - createdAt));
+
+        vm.warp(checkpointA + 3 hours);
+        _moveToTick(START_TICK - 250);
+        int24 t2 = _tick();
+        uint32 s2 = uint32(_time());
+        IOathHook.Epoch memory e = hook.epochData(key);
+        assertTrue(e.doneA && !e.doneB, "only A due");
+        int256 expectedA = cumS1 + int256(t1) * int256(uint256(checkpointA - s1));
+        assertEq(e.cumA, expectedA, "cumA exact at E - W");
+
+        vm.warp(epochEnd + 4 hours);
+        hook.poke(key);
+        e = hook.epochData(key);
+        int256 cumS2 = cumS1 + int256(t1) * int256(uint256(s2 - s1));
+        assertTrue(e.doneB, "B recorded");
+        assertEq(e.cumB, cumS2 + int256(t2) * int256(uint256(epochEnd - s2)), "cumB exact at E");
+    }
+
+    /// @dev One action long after the epoch end records both checkpoints, each at its own time.
+    function test_oracle_bothCheckpointsByOneLateAction() public {
+        _createPool(START_TICK);
+        uint32 epochEnd = uint32(_time() + 1 days);
+        _openEpoch(epochEnd, 30 minutes);
+
+        vm.warp(epochEnd + 10 hours);
+        _moveToTick(START_TICK + 1_000);
+        IOathHook.Epoch memory e = hook.epochData(key);
+        assertTrue(e.doneA && e.doneB, "both recorded");
+        assertEq(e.cumA, int256(START_TICK) * int256(uint256(epochEnd - 30 minutes - createdAt)), "cumA");
+        assertEq(e.cumB, int256(START_TICK) * int256(uint256(epochEnd - createdAt)), "cumB");
+    }
+
+    /// @dev A checkpoint is due at its own second (`t* ≤ now`), not one second earlier.
+    function test_oracle_checkpointDueAtItsOwnSecond() public {
+        _createPool(START_TICK);
+        uint32 epochEnd = uint32(_time() + 1 days);
+        uint32 checkpointA = epochEnd - 30 minutes;
+        _openEpoch(epochEnd, 30 minutes);
+
+        vm.warp(checkpointA - 1);
+        hook.poke(key);
+        assertFalse(hook.epochData(key).doneA, "not due at E - W - 1");
+
+        vm.warp(checkpointA);
+        hook.poke(key);
+        IOathHook.Epoch memory e = hook.epochData(key);
+        assertTrue(e.doneA && !e.doneB, "A due at E - W");
+        assertEq(e.cumA, int256(START_TICK) * int256(uint256(checkpointA - createdAt)));
+
+        vm.warp(epochEnd - 1);
+        hook.poke(key);
+        assertFalse(hook.epochData(key).doneB, "not due at E - 1");
+        vm.warp(epochEnd);
+        hook.poke(key);
+        assertEq(hook.epochData(key).cumB, int256(START_TICK) * int256(uint256(epochEnd - createdAt)), "B at E");
+    }
+
+    /// @dev From the same state, a poke, a donation and a swap record the same checkpoint.
+    function test_oracle_checkpointPathsAgree() public {
+        _createPool(START_TICK);
+        uint32 epochEnd = uint32(_time() + 1 days);
+        _openEpoch(epochEnd, 6 hours);
+        _wait(3 hours);
+        _moveToTick(START_TICK + 123);
+        vm.warp(epochEnd - 1 hours);
+        uint256 snap = vm.snapshotState();
+
+        hook.poke(key);
+        int256 viaPoke = hook.epochData(key).cumA;
+
+        vm.revertToState(snap);
+        donateRouter.donate(key, 1e9, 1e9, ZERO_BYTES);
+        int256 viaDonate = hook.epochData(key).cumA;
+
+        vm.revertToState(snap);
+        _moveToTick(START_TICK - 900);
+        int256 viaSwap = hook.epochData(key).cumA;
+
+        assertTrue(viaPoke != 0, "recorded");
+        assertEq(viaDonate, viaPoke, "donate == poke");
+        assertEq(viaSwap, viaPoke, "swap == poke");
+    }
+
+    function test_oracle_checkpointEvents() public {
+        _createPool(START_TICK);
+        uint32 epochEnd = uint32(_time() + 1 days);
+        _openEpoch(epochEnd, 30 minutes);
+        vm.warp(epochEnd + 1);
+
+        vm.expectEmit(true, false, false, true, address(hook));
+        emit IOathHook.CheckpointRecorded(
+            id, epochEnd - 30 minutes, int256(START_TICK) * int256(uint256(epochEnd - 30 minutes - createdAt))
+        );
+        vm.expectEmit(true, false, false, true, address(hook));
+        emit IOathHook.CheckpointRecorded(id, epochEnd, int256(START_TICK) * int256(uint256(epochEnd - createdAt)));
+        hook.poke(key);
+    }
+
+    /// @dev Without an open epoch nothing is recorded, however much time passes.
+    function test_oracle_noCheckpointWithoutEpoch() public {
+        _createPool(START_TICK);
+        _wait(30 days);
+        hook.poke(key);
+        IOathHook.Epoch memory e = hook.epochData(key);
+        assertEq(abi.encode(e), abi.encode(IOathHook.Epoch(0, 0, false, false, false, false, 0, 0, 0, 0, 0, 0)));
+    }
+
+    /// @dev The internal consistency check: a checkpoint at or before `lastTimestamp` reverts. Unreachable
+    ///      through the hook's own functions, so the oracle's `lastTimestamp` is corrupted with `vm.store`.
+    function test_oracle_checkpointInPastReverts() public {
+        _createPool(START_TICK);
+        uint32 epochEnd = uint32(_time() + 1 days);
+        uint32 checkpointA = epochEnd - 30 minutes;
+        _openEpoch(epochEnd, 30 minutes);
+
+        bytes32 slot = keccak256(abi.encode(PoolId.unwrap(id), uint256(0))); // oracles[id], first word
+        uint256 word = uint256(vm.load(address(hook), slot));
+        (uint32 lastTimestamp,,,) = hook.oracles(id);
+        assertEq(uint32(word), lastTimestamp, "slot layout");
+        vm.store(address(hook), slot, bytes32((word & ~uint256(type(uint32).max)) | checkpointA));
+
+        vm.warp(checkpointA + 10);
+        vm.expectRevert(IOathHook.CheckpointInPast.selector);
+        hook.poke(key);
+    }
+
+    /// @dev Both checkpoints equal the brute-force cumulative at exactly `E − W` and `E`, for any history of
+    ///      swaps, donations, pokes and time jumps across the epoch.
+    function testFuzz_oracle_checkpointsMatchBruteForce(uint256 seed, uint32 twapWindow) public {
+        _createPool(START_TICK);
+        _record();
+        uint32 epochEnd = uint32(_time() + 1 days);
+        twapWindow = uint32(bound(twapWindow, 1, 1 days - 1));
+        _openEpoch(epochEnd, twapWindow);
+
+        for (uint256 i; i < 16; i++) {
+            uint256 r = uint256(keccak256(abi.encode(seed, i)));
+            if (r % 4 != 0) _nextBlock(1 + (r >> 8) % 6 hours);
+            uint256 action = (r >> 64) % 4;
+            if (action <= 1) {
+                _moveToTick(START_TICK + int24(int256((r >> 96) % 20_001)) - 10_000);
+            } else if (action == 2) {
+                donateRouter.donate(key, 1e6, 1e6, ZERO_BYTES);
+            } else {
+                hook.poke(key);
+            }
+            _record();
+        }
+        if (_time() < epochEnd) vm.warp(epochEnd + seed % 1 days);
+        hook.poke(key);
+
+        IOathHook.Epoch memory e = hook.epochData(key);
+        assertTrue(e.doneA && e.doneB, "both recorded");
+        assertEq(e.cumA, _bruteForceAt(epochEnd - twapWindow), "cumA");
+        assertEq(e.cumB, _bruteForceAt(epochEnd), "cumB");
+    }
+
     // ---------------------------------------------------------------- brute force
 
     /// @dev Every (time, tick) segment the pool has been through since creation.
@@ -273,10 +446,15 @@ contract OathHookOracleTest is OathTestBase {
     }
 
     /// @dev Σ tick_i · (t_{i+1} − t_i) over all segments, the last one running to now.
-    function _bruteForce() internal view returns (int256 sum) {
+    function _bruteForce() internal view returns (int256) {
+        return _bruteForceAt(_time());
+    }
+
+    /// @dev The same sum cut off at time `t` (segments starting at or after `t` add nothing).
+    function _bruteForceAt(uint256 t) internal view returns (int256 sum) {
         uint256 n = segTicks.length;
-        for (uint256 i; i < n; i++) {
-            uint256 end = i + 1 < n ? segTimes[i + 1] : _time();
+        for (uint256 i; i < n && segTimes[i] < t; i++) {
+            uint256 end = i + 1 < n && segTimes[i + 1] < t ? segTimes[i + 1] : t;
             sum += int256(segTicks[i]) * int256(end - segTimes[i]);
         }
     }
@@ -318,6 +496,11 @@ contract OathHookOracleTest is OathTestBase {
         vm.warp(_time() + dt);
     }
 
+    function _openEpoch(uint32 epochEnd, uint32 twapWindow) internal {
+        vm.prank(vault);
+        hook.openEpoch(key, epochEnd, twapWindow);
+    }
+
     function _initializeAt(int24 tick) internal {
         vm.prank(factory);
         manager.initialize(key, TickMath.getSqrtPriceAtTick(tick));
@@ -347,7 +530,8 @@ contract OathHookOracleTest is OathTestBase {
 }
 
 /// @notice `beforeSwap` gas on a pool in steady state: created, swapped and advanced in earlier transactions
-///         (`setUp`), so the oracle's slots already hold non-zero values, as on a live pool.
+///         (`setUp`), so the oracle's slots already hold non-zero values, as on a live pool, with an epoch in
+///         progress and no checkpoint due.
 /// @dev These tests turn test isolation off, so each test is one transaction: with isolation every top-level
 ///      call would be a separate transaction, always cold and including the 21,000 transaction base cost.
 contract OathHookSwapGasTest is OathTestBase {
@@ -372,6 +556,8 @@ contract OathHookSwapGasTest is OathTestBase {
         vm.roll(vm.getBlockNumber() + 1);
         vm.warp(vm.getBlockTimestamp() + 60);
         _moveTo(key, TickMath.getSqrtPriceAtTick(-199100));
+        vm.prank(makeAddr("vault"));
+        hook.openEpoch(key, uint32(vm.getBlockTimestamp() + 7 days), 30 minutes);
         // The tests run in the next block.
         vm.roll(vm.getBlockNumber() + 1);
         vm.warp(vm.getBlockTimestamp() + 12);
@@ -384,6 +570,7 @@ contract OathHookSwapGasTest is OathTestBase {
     function test_gas_beforeSwapWarmSteadyState() public {
         hook.oracles(id);
         hook.cumulativeNow(key);
+        hook.epochData(key);
 
         uint256 firstOfBlock = _beforeSwapGas();
         uint256 sameBlock = _beforeSwapGas();
