@@ -102,6 +102,12 @@ contract OathVault is ERC20, ReentrancyGuardTransient {
         CAP_BPS = params_.capBps;
     }
 
+    /// @notice Accepts ETH only from the PoolManager (native currency0 taken out of the pool). Depositors send ETH
+    ///         through `deposit`.
+    receive() external payable {
+        if (msg.sender != address(MANAGER)) revert IOathVault.OnlyManager();
+    }
+
     // ---------------------------------------------------------------- shares
 
     /// @notice Deposits in kind during the open window and mints shares to `receiver` (MATH.md §11). Price-free:
@@ -109,10 +115,12 @@ contract OathVault is ERC20, ReentrancyGuardTransient {
     ///           taken in full;
     ///         - later deposits: `shares = min_i mulDiv(supply, a_i, h_i)` over the tokens the vault holds
     ///           (`h_i > 0`), and `used_i = mulDivUp(h_i, shares, supply)` is taken; the rest is not.
-    /// @dev Holdings `h_i` are the idle balances before this deposit (bond excluded). Shares round down and taken
-    ///      amounts round up, so rounding favours the vault. `a0·a1` must fit in 256 bits.
+    /// @dev Holdings `h_i` are the idle balances before this deposit (bond excluded; for native currency0, the
+    ///      ETH sent with this call excluded). Shares round down and taken amounts round up, so rounding favours the
+    ///      vault. `a0·a1` must fit in 256 bits. For native currency0, `msg.value` must equal `amount0Max` and the
+    ///      unused ETH is refunded to the sender; otherwise no ETH may be sent.
     ///      Reverts `NotOpen()`, `BadNativeAmount()`, `ZeroShares()`, `EmptyVault()`, `Slippage()`.
-    /// @param amount0Max Maximum currency0 to deposit.
+    /// @param amount0Max Maximum currency0 to deposit (equal to `msg.value` if currency0 is native).
     /// @param amount1Max Maximum currency1 to deposit.
     /// @param minShares Minimum shares to mint, else `Slippage()`.
     /// @param receiver Receiver of the shares.
@@ -126,7 +134,8 @@ contract OathVault is ERC20, ReentrancyGuardTransient {
         returns (uint256 shares, uint256 used0, uint256 used1)
     {
         if (state != IOathVault.State.OPEN) revert IOathVault.NotOpen();
-        if (msg.value != 0) revert IOathVault.BadNativeAmount();
+        bool native = CURRENCY0.isAddressZero();
+        if (native ? msg.value != amount0Max : msg.value != 0) revert IOathVault.BadNativeAmount();
 
         uint256 supply = totalSupply();
         if (supply == 0) {
@@ -137,14 +146,18 @@ contract OathVault is ERC20, ReentrancyGuardTransient {
             (used0, used1) = (amount0Max, amount1Max);
             _mint(DEAD, MIN_SHARES);
         } else {
-            (shares, used0, used1) = _proportional(supply, amount0Max, amount1Max, idle0(), idle1());
+            // The ETH sent with this call is already in the balance; it is not yet part of the holdings.
+            (shares, used0, used1) = _proportional(supply, amount0Max, amount1Max, idle0() - msg.value, idle1());
         }
         if (shares < minShares) revert IOathVault.Slippage();
 
-        if (used0 != 0) IERC20(Currency.unwrap(CURRENCY0)).safeTransferFrom(msg.sender, address(this), used0);
+        if (!native && used0 != 0) {
+            IERC20(Currency.unwrap(CURRENCY0)).safeTransferFrom(msg.sender, address(this), used0);
+        }
         if (used1 != 0) IERC20(Currency.unwrap(CURRENCY1)).safeTransferFrom(msg.sender, address(this), used1);
         _mint(receiver, shares);
         emit IOathVault.Deposit(msg.sender, receiver, used0, used1, shares);
+        if (native && amount0Max > used0) CURRENCY0.transfer(msg.sender, amount0Max - used0);
     }
 
     /// @notice Burns `shares` from the caller for a pro-rata share of both idle currencies during the open window,

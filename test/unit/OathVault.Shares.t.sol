@@ -2,7 +2,11 @@
 pragma solidity 0.8.26;
 
 import {IERC20Errors} from "@openzeppelin/contracts/interfaces/draft-IERC6093.sol";
+import {ReentrancyGuardTransient} from "@openzeppelin/contracts/utils/ReentrancyGuardTransient.sol";
+import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
+import {Currency, CurrencyLibrary} from "@uniswap/v4-core/src/types/Currency.sol";
 import {IOathVault} from "../../src/interfaces/IOathVault.sol";
+import {OathVault} from "../../src/OathVault.sol";
 import {OathVaultTestBase} from "../utils/OathVaultTestBase.sol";
 
 /// @notice OathVault shares (MATH.md §11) on a vault created through the real factory: in-kind, price-free
@@ -248,5 +252,136 @@ contract OathVaultSharesTest is OathVaultTestBase {
         } catch (bytes memory reason) {
             assertEq(bytes4(reason), IOathVault.ZeroShares.selector);
         }
+    }
+}
+
+/// @notice Receives ETH from the vault and tries to re-enter it; records what the vault answered.
+contract Reenterer {
+    OathVault internal immutable VAULT;
+    bytes4 public caught;
+
+    constructor(OathVault vault_) {
+        VAULT = vault_;
+    }
+
+    function approveVault(address token) external {
+        IERC20(token).approve(address(VAULT), type(uint256).max);
+    }
+
+    /// @dev Deposits with more ETH than will be used, so the vault refunds the rest to this contract.
+    function depositWithExcess(uint256 amount1) external payable {
+        VAULT.deposit{value: msg.value}(msg.value, amount1, 0, address(this));
+    }
+
+    receive() external payable {
+        try VAULT.withdraw(0, 0, 0, address(this)) {
+            caught = bytes4(0xffffffff);
+        } catch (bytes memory reason) {
+            caught = bytes4(reason);
+        }
+    }
+}
+
+/// @notice OathVault shares with native ETH as currency0, the demo's shape.
+contract OathVaultNativeSharesTest is OathVaultTestBase {
+    function setUp() public override {
+        super.setUp();
+        _createVault(CurrencyLibrary.ADDRESS_ZERO);
+        _give(alice, 1_000 ether, 1e30);
+        _give(bob, 1_000 ether, 1e30);
+    }
+
+    /// @dev The first deposit takes all the ETH sent.
+    function test_native_firstDeposit() public {
+        uint256 before = alice.balance;
+        (uint256 shares, uint256 used0,) = _deposit(alice, 4 ether, 9 ether);
+        assertEq(shares, 6 ether - 1_000);
+        assertEq(used0, 4 ether);
+        assertEq(before - alice.balance, 4 ether, "ETH taken");
+        assertEq(address(vault).balance, 4 ether);
+        assertEq(vault.idle0(), 4 ether);
+    }
+
+    /// @dev `msg.value` must equal `amount0Max`, both ways.
+    function test_native_valueMustMatchAmount0Max() public {
+        vm.startPrank(alice);
+        vm.expectRevert(IOathVault.BadNativeAmount.selector);
+        vault.deposit{value: 1 ether - 1}(1 ether, 1 ether, 0, alice);
+        vm.expectRevert(IOathVault.BadNativeAmount.selector);
+        vault.deposit{value: 1 ether + 1}(1 ether, 1 ether, 0, alice);
+        vm.stopPrank();
+    }
+
+    /// @dev A later deposit prices against holdings that exclude the ETH just sent, takes `used0` and refunds
+    ///      the rest to the sender.
+    function test_native_laterDepositRefundsUnusedEth() public {
+        _deposit(alice, 1 ether, 4 ether); // supply 2e18
+        uint256 before = bob.balance;
+        (uint256 shares, uint256 used0, uint256 used1) = _deposit(bob, 5 ether, 4 ether); // currency1 binds
+        assertEq(shares, 2 ether, "supply*a1/h1 = 2e18*4e18/4e18");
+        assertEq(used0, 1 ether, "ETH at the vault ratio");
+        assertEq(used1, 4 ether);
+        assertEq(before - bob.balance, 1 ether, "4 ETH refunded");
+        assertEq(address(vault).balance, 2 ether);
+    }
+
+    /// @dev With no ETH in the vault, a deposit takes none and refunds all of it.
+    function test_native_noEthHeldRefundsAll() public {
+        _deposit(alice, 1 ether, 1 ether);
+        _setIdle0(0);
+        uint256 before = bob.balance;
+        (, uint256 used0,) = _deposit(bob, 3 ether, 1 ether);
+        assertEq(used0, 0);
+        assertEq(bob.balance, before, "all ETH refunded");
+    }
+
+    /// @dev Withdrawals pay ETH to the receiver.
+    function test_native_withdrawPaysEth() public {
+        _deposit(alice, 2 ether, 2 ether);
+        address payable receiver = payable(makeAddr("receiver"));
+        vm.prank(alice);
+        (uint256 out0, uint256 out1) = vault.withdraw(1 ether, 0, 0, receiver);
+        assertEq(out0, 1 ether);
+        assertEq(out1, 1 ether);
+        assertEq(receiver.balance, 1 ether, "ETH received");
+        assertEq(currency1.balanceOf(receiver), 1 ether);
+    }
+
+    /// @dev Plain ETH transfers are refused unless they come from the PoolManager.
+    function test_native_receiveOnlyFromManager() public {
+        vm.prank(alice);
+        (bool ok, bytes memory reason) = address(vault).call{value: 1 ether}("");
+        assertFalse(ok, "refused");
+        assertEq(bytes4(reason), IOathVault.OnlyManager.selector);
+
+        vm.deal(address(manager), 1 ether);
+        vm.prank(address(manager));
+        (ok,) = address(vault).call{value: 1 ether}("");
+        assertTrue(ok, "accepted from the PoolManager");
+    }
+
+    /// @dev Re-entering from the ETH sent by a withdrawal is blocked.
+    function test_native_reentryFromWithdrawalBlocked() public {
+        _deposit(alice, 2 ether, 2 ether);
+        Reenterer attacker = new Reenterer(vault);
+        vm.prank(alice);
+        vault.withdraw(1 ether, 0, 0, address(attacker));
+        assertEq(attacker.caught(), ReentrancyGuardTransient.ReentrancyGuardReentrantCall.selector);
+        assertEq(address(attacker).balance, 1 ether, "the outer withdrawal still paid");
+    }
+
+    /// @dev Re-entering from the ETH refunded by a deposit is blocked.
+    function test_native_reentryFromRefundBlocked() public {
+        _deposit(alice, 1 ether, 1 ether);
+        Reenterer attacker = new Reenterer(vault);
+        _fund(currency1, address(attacker), 1 ether);
+        attacker.approveVault(Currency.unwrap(currency1));
+
+        uint256 before = address(attacker).balance;
+        vm.deal(address(this), 3 ether);
+        attacker.depositWithExcess{value: 3 ether}(1 ether); // the vault takes 1 ETH, refunds 2
+        assertEq(attacker.caught(), ReentrancyGuardTransient.ReentrancyGuardReentrantCall.selector);
+        assertEq(address(attacker).balance - before, 2 ether, "refund still paid");
+        assertEq(vault.balanceOf(address(attacker)), 1 ether, "shares minted");
     }
 }

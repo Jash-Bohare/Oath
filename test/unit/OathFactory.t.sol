@@ -83,7 +83,7 @@ contract OathFactoryTest is OathTestBase {
         assertEq(tickCumulative, 0);
 
         // The vault: its pool, parameters, curator, factory and first open window.
-        OathVault oathVault = OathVault(v);
+        OathVault oathVault = OathVault(payable(v));
         assertEq(abi.encode(oathVault.poolKey()), abi.encode(key_), "vault key");
         assertEq(PoolId.unwrap(oathVault.poolId()), PoolId.unwrap(id), "vault pool id");
         assertEq(abi.encode(oathVault.params()), abi.encode(_defaultParams()), "vault params");
@@ -103,8 +103,8 @@ contract OathFactoryTest is OathTestBase {
         PoolKey memory ethKey = _oathKey(CurrencyLibrary.ADDRESS_ZERO, currency1);
         (address registered,,,) = hook.configs(ethKey.toId());
         assertEq(registered, v);
-        assertEq(OathVault(v).name(), "Oath ETH/TEST");
-        assertEq(OathVault(v).params().epochDuration, 1 days);
+        assertEq(OathVault(payable(v)).name(), "Oath ETH/TEST");
+        assertEq(OathVault(payable(v)).params().epochDuration, 1 days);
     }
 
     /// @dev If the PoolManager rejects the pool, nothing is created: no registration, no pool.
@@ -356,7 +356,7 @@ contract OathFactoryTest is OathTestBase {
     /// @dev Creates a vault for a fresh pool key and checks it stored `p`.
     function _create(IOathVault.VaultParams memory p) internal returns (address v) {
         v = factory.createVault(currency0, currency1, nextFee++, TICK_SPACING, startPrice, curator, p);
-        assertEq(abi.encode(OathVault(v).params()), abi.encode(p), "params stored");
+        assertEq(abi.encode(OathVault(payable(v)).params()), abi.encode(p), "params stored");
     }
 
     function _expectBad(IOathVault.VaultParams memory p, bytes4 err) internal {

@@ -66,11 +66,12 @@ contract OathFactory is IOathFactory {
         PoolKey memory key = PoolKey({
             currency0: currency0, currency1: currency1, fee: fee, tickSpacing: tickSpacing, hooks: IHooks(address(HOOK))
         });
-        vault = address(new OathVault(MANAGER, HOOK, key, curator, params));
+        OathVault newVault = new OathVault(MANAGER, HOOK, key, curator, params);
+        vault = address(newVault);
         HOOK.registerVault(key, vault, params.maxIntraBlockTicks);
         // forge-lint: disable-next-line(unused-return)
         MANAGER.initialize(key, sqrtPriceX96); // the returned start tick is not needed
-        OathVault(vault).initOpenWindow();
+        newVault.initOpenWindow();
 
         // After the calls because the vault's address only exists after `new`. They go to the hook, the
         // PoolManager and the new vault; the only foreign code is a token's `symbol()` in the vault's
