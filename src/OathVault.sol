@@ -335,6 +335,35 @@ contract OathVault is ERC20, IUnlockCallback, ReentrancyGuardTransient {
         _reposition(tickLower, tickUpper, swap);
     }
 
+    /// @notice Moves the vault's position to a new range during an epoch, with an optional exact-input swap in
+    ///         between: removes the whole position (principal and uncollected fees become idle), swaps, then adds
+    ///         the most liquidity the idle balances buy at the new range. Curator only, while ACTIVE, before `E`,
+    ///         and at least `rebalanceCooldown` after the last reposition.
+    /// @dev Every cost of a rebalance (swap fees, price impact, rounding) lowers the vault's NAV and not the
+    ///      benchmark's, so the curator must beat passive after costs (MATH.md §9.3). The hook's guard bounds the
+    ///      price impact of the curator's own swap to `maxIntraBlockTicks` per block, and blocks a same-block
+    ///      sandwich of the liquidity changes. Reverts, in this order: `NotCurator()`, `NotActive()`,
+    ///      `EpochEnded()` if `now ≥ E`, `Cooldown()` if `now < lastReposition + rebalanceCooldown`, `BadRange()`;
+    ///      then the reposition's own errors (`ExactInputOnly()`, `BondTouched()`, the hook's guard).
+    /// @param tickLower New lower tick.
+    /// @param tickUpper New upper tick.
+    /// @param swap Optional exact-input swap between removing and adding liquidity (`amountSpecified == 0`: none).
+    function rebalance(int24 tickLower, int24 tickUpper, IOathVault.SwapIntent calldata swap) external nonReentrant {
+        if (msg.sender != CURATOR) revert IOathVault.NotCurator();
+        if (state != IOathVault.State.ACTIVE) revert IOathVault.NotActive();
+        // forge-lint: disable-next-line(unsafe-typecast)
+        uint32 nowTs = uint32(block.timestamp); // fits until 2106
+        if (nowTs >= epochEnd) revert IOathVault.EpochEnded();
+        if (nowTs < lastReposition + REBALANCE_COOLDOWN) revert IOathVault.Cooldown();
+        _checkRange(tickLower, tickUpper);
+
+        lastReposition = nowTs;
+        _reposition(tickLower, tickUpper, swap);
+        // `L_v` is known only after the reposition; the reentrancy lock is held throughout.
+        // forge-lint: disable-next-line(reentrancy-events)
+        emit IOathVault.Rebalanced(tickLower, tickUpper, positionLiquidity);
+    }
+
     // ---------------------------------------------------------------- position
 
     /// @notice The PoolManager's callback for the vault's own `unlock`. PoolManager only: the PoolManager calls
