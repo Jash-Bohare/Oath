@@ -213,6 +213,18 @@ contract OathVault is ERC20, ReentrancyGuardTransient {
 
     // ---------------------------------------------------------------- open window
 
+    /// @notice Restarts an open window that has run longer than `maxOpen`: `T0 = now`,
+    ///         `cumAtOpen = hook.cumulativeNow(key)`. Anyone, OPEN only. Without it, a vault whose curator waited
+    ///         too long could never start an epoch, since the start TWAP must span at most `maxOpen` (MATH.md §5).
+    /// @dev Reverts `NotOpen()`, or `OpenWindowNotExpired()` unless `now − openSince > maxOpen`.
+    function refreshOpenWindow() external nonReentrant {
+        if (state != IOathVault.State.OPEN) revert IOathVault.NotOpen();
+        // Open windows are hours long; validator timestamp skew of seconds is irrelevant here.
+        // forge-lint: disable-next-line(block-timestamp)
+        if (block.timestamp - openSince <= MAX_OPEN) revert IOathVault.OpenWindowNotExpired();
+        _startOpenWindow();
+    }
+
     /// @notice Starts the first open window right after pool initialization: `T0 = now`,
     ///         `cumAtOpen = hook.cumulativeNow(key)`. Factory only, once.
     /// @dev Reverts `OnlyFactory()` or `AlreadyInitialized()`.
