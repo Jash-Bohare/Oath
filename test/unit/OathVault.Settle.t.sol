@@ -252,6 +252,83 @@ contract OathVaultSettleTest is OathVaultTestBase {
         assertEq(vault.getResult(0).endTick, START_TICK, "marked at the TWAP, not the moved spot");
     }
 
+    // ---------------------------------------------------------------- snapshot exactness
+
+    /// @dev Settlement is deterministic (MATH.md §8): swaps after `E`, through the vault's range and over several
+    ///      blocks, change nothing in the `EpochResult`. The first of them records the checkpoints and the snapshot
+    ///      exactly as the settle-time poke would, and the vault is frozen. The fees they pay the still-deployed
+    ///      position are not measured; they end up idle for the depositors (the gap belongs to them).
+    function test_settle_postEpochSwapsDoNotChangeResult() public {
+        _begin(RANGE_LOWER, RANGE_UPPER);
+        _swapAroundStart(3);
+        _toEnd();
+        uint256 atEnd = vm.snapshotState();
+        uint256 blockAtEnd = _block();
+
+        // A: no swap after E; settled an hour later.
+        vm.roll(blockAtEnd + 4);
+        vm.warp(endsAt + 1 hours);
+        _settleAs(keeper);
+        IOathVault.EpochResult memory a = vault.getResult(0);
+        (uint256 a0, uint256 a1) = (vault.idle0(), vault.idle1());
+
+        // B: flow through the range right after E, back to the end price; settled at the same time.
+        vm.revertToState(atEnd);
+        vm.roll(blockAtEnd + 1);
+        vm.warp(endsAt + 10 minutes);
+        _moveToTick(START_TICK - 40);
+        assertTrue(hook.epochData(key).snapTaken, "the first swap after E took the snapshot");
+        vm.roll(blockAtEnd + 2);
+        vm.warp(endsAt + 20 minutes);
+        _moveToTick(START_TICK + 40);
+        vm.roll(blockAtEnd + 3);
+        vm.warp(endsAt + 30 minutes);
+        _moveToTick(START_TICK);
+        vm.roll(blockAtEnd + 4);
+        vm.warp(endsAt + 1 hours);
+        _settleAs(keeper);
+        IOathVault.EpochResult memory b = vault.getResult(0);
+
+        assertEq(abi.encode(b), abi.encode(a), "identical EpochResult");
+        uint160 sqrtP = TickMath.getSqrtPriceAtTick(START_TICK);
+        assertGe(vault.idle0(), a0, "post-E fees in currency0");
+        assertGe(vault.idle1(), a1, "post-E fees in currency1");
+        assertGt(
+            ValuationLib.value(vault.idle0(), vault.idle1(), sqrtP),
+            ValuationLib.value(a0, a1, sqrtP),
+            "depositors keep the post-E fees"
+        );
+    }
+
+    /// @dev Spot manipulation at `E` (MATH.md §9.3): pushing the price 2,000 ticks right after `E` and holding
+    ///      it through settlement changes nothing in the result, because both sides are marked at the TWAP over
+    ///      `[E − W, E]`, recorded before the push.
+    function test_settle_spotManipulationAtE_noEffect() public {
+        _begin(RANGE_LOWER, RANGE_UPPER);
+        _swapAroundStart(3);
+        _toEnd();
+        uint256 atEnd = vm.snapshotState();
+        uint256 blockAtEnd = _block();
+
+        vm.roll(blockAtEnd + 2);
+        vm.warp(endsAt + 1 minutes);
+        _settleAs(keeper);
+        IOathVault.EpochResult memory honest = vault.getResult(0);
+
+        vm.revertToState(atEnd);
+        vm.roll(blockAtEnd + 1);
+        vm.warp(endsAt + 12);
+        _moveToTick(START_TICK + 2_000);
+        vm.roll(blockAtEnd + 2);
+        vm.warp(endsAt + 1 minutes);
+        _settleAs(keeper);
+        IOathVault.EpochResult memory pushed = vault.getResult(0);
+
+        assertEq(_tick(), START_TICK + 2_000, "spot still pushed at settlement");
+        assertEq(abi.encode(pushed), abi.encode(honest), "identical EpochResult");
+        assertEq(pushed.endTick, START_TICK, "end price is the TWAP, not the pushed spot");
+    }
+
     // ---------------------------------------------------------------- unwind and reopen
 
     /// @dev Settlement removes the whole position (principal and fees become idle), closes the hook's epoch and
