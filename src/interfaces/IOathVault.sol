@@ -119,7 +119,8 @@ interface IOathVault {
     event BondPosted(uint256 amount, uint256 bondBalance);
     /// @notice Emitted when the curator withdraws `amount` currency1 from the bond.
     event BondWithdrawn(uint256 amount, uint256 bondBalance);
-    /// @notice Emitted when the open window starts (`initOpenWindow`) or restarts (`refreshOpenWindow`).
+    /// @notice Emitted when an open window starts: at creation (`initOpenWindow`), on `refreshOpenWindow`, and
+    ///         when `settle` reopens the vault.
     event OpenWindowRefreshed(uint32 openSince, int256 cumAtOpen);
     /// @notice Emitted when an epoch starts.
     event EpochStarted(

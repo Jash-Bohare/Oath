@@ -39,7 +39,8 @@ contract OathVault is ERC20, IUnlockCallback, ReentrancyGuardTransient {
 
     /// @dev What the vault's own `unlock` does in `unlockCallback`.
     enum Action {
-        REPOSITION
+        REPOSITION,
+        UNWIND
     }
 
     /// @notice Shares minted to `DEAD` on the first deposit, so the share price cannot be inflated (MATH.md §11).
@@ -73,7 +74,7 @@ contract OathVault is ERC20, IUnlockCallback, ReentrancyGuardTransient {
     uint16 private immutable CAP_BPS;
 
     /// @notice Current lifecycle state. Deposits and withdrawals happen only while OPEN.
-    /// @dev OPEN (the zero value) at creation; `startEpoch` moves it to ACTIVE.
+    /// @dev OPEN (the zero value) at creation; `startEpoch` moves it to ACTIVE and `settle` back to OPEN.
     IOathVault.State public state;
     /// @notice Currency1 held as the curator's bond. Part of the vault's currency1 balance, but not of `idle1`
     ///         or of NAV.
@@ -376,10 +377,18 @@ contract OathVault is ERC20, IUnlockCallback, ReentrancyGuardTransient {
     ///         5. Verdict: `SettlementLib.settle` (MATH.md §9).
     ///         6. Apply: the payout moves from the bond to the depositors (the tokens stay in the vault and
     ///            become idle); the fee shares are minted to the curator.
+    ///         7. Unwind: remove the whole position; its principal and all uncollected fees, including any earned
+    ///            after `E`, become idle.
+    ///         8. `hook.closeEpoch`.
     ///         9. Store the `EpochResult` and emit `Settled`.
+    ///         10. Reopen: OPEN, with a new open window from now (`T0 = now`, `cumAtOpen = hook.cumulativeNow`).
     /// @dev Both sides are marked at the same TWAP, never at spot, so moving the price at `E` cannot favour
-    ///      either (MATH.md §9.3). Reverts `NotActive()`, `EpochNotEnded()`, or `IOathHook.EpochNotReady()` if the
-    ///      hook has not recorded both checkpoints and the snapshot (impossible after the poke; checked anyway).
+    ///      either (MATH.md §9.3). Between `E` and settlement the position stays in the pool unmeasured; what it
+    ///      earns or loses in that gap belongs to the depositors and counts toward the next epoch's start NAV.
+    ///      The unwind is subject to the hook's guard: if the price moved more than `maxIntraBlockTicks` earlier in
+    ///      the block, `settle` reverts and anyone can retry in a later block. Reverts `NotActive()`,
+    ///      `EpochNotEnded()`, or `IOathHook.EpochNotReady()` if the hook has not recorded both checkpoints and
+    ///      the snapshot (impossible after the poke; checked anyway).
     function settle() external nonReentrant {
         if (state != IOathVault.State.ACTIVE) revert IOathVault.NotActive();
         // Epochs are days long; validator timestamp skew of seconds is irrelevant here.
@@ -388,9 +397,10 @@ contract OathVault is ERC20, IUnlockCallback, ReentrancyGuardTransient {
         PoolKey memory key = poolKey();
 
         // The steps run in the order above. The hook and the PoolManager are trusted and this function holds the
-        // reentrancy lock, so events after their calls cannot be reordered by reentry.
+        // reentrancy lock, so the state written and the events emitted after their calls are safe from reentry.
 
         // 1. Checkpoints and boundary snapshot.
+        // forge-lint: disable-next-line(reentrancy-no-eth)
         HOOK.poke(key);
         IOathHook.Epoch memory e = HOOK.epochData(key);
         if (!(e.snapTaken && e.doneA && e.doneB)) revert IOathHook.EpochNotReady();
@@ -422,6 +432,13 @@ contract OathVault is ERC20, IUnlockCallback, ReentrancyGuardTransient {
             if (excessShortfall > r.payout) emit IOathVault.BondExhausted(excessShortfall - r.payout);
         }
 
+        // 7. Unwind.
+        _unwind();
+
+        // 8. Close the hook's epoch.
+        // forge-lint: disable-next-line(reentrancy-no-eth)
+        HOOK.closeEpoch(key);
+
         // 9. Record.
         r.start = epochStart;
         r.end = epochEnd;
@@ -432,20 +449,28 @@ contract OathVault is ERC20, IUnlockCallback, ReentrancyGuardTransient {
         results.push(r);
         // forge-lint: disable-next-line(reentrancy-events)
         emit IOathVault.Settled(epoch, r);
+
+        // 10. Reopen.
+        state = IOathVault.State.OPEN;
+        _startOpenWindow();
     }
 
     // ---------------------------------------------------------------- position
 
     /// @notice The PoolManager's callback for the vault's own `unlock`. PoolManager only: the PoolManager calls
-    ///         back the contract that unlocked it, so only the vault's own repositions reach this.
-    /// @dev Reverts `OnlyManager()`. See `_onReposition` for the steps.
-    /// @param data `abi.encode(Action.REPOSITION, tickLower, tickUpper, swap)`.
+    ///         back the contract that unlocked it, so only the vault's own repositions and unwinds reach this.
+    /// @dev Reverts `OnlyManager()`. See `_onReposition` and `_onUnwind` for the steps.
+    /// @param data `abi.encode(Action.REPOSITION, tickLower, tickUpper, swap)` or `abi.encode(Action.UNWIND)`.
     /// @return Empty bytes.
     function unlockCallback(bytes calldata data) external returns (bytes memory) {
         if (msg.sender != address(MANAGER)) revert IOathVault.OnlyManager();
-        (, int24 tickLower, int24 tickUpper, IOathVault.SwapIntent memory swap) =
-            abi.decode(data, (Action, int24, int24, IOathVault.SwapIntent));
-        _onReposition(tickLower, tickUpper, swap);
+        if (abi.decode(data, (Action)) == Action.UNWIND) {
+            _onUnwind();
+        } else {
+            (, int24 tickLower, int24 tickUpper, IOathVault.SwapIntent memory swap) =
+                abi.decode(data, (Action, int24, int24, IOathVault.SwapIntent));
+            _onReposition(tickLower, tickUpper, swap);
+        }
         return "";
     }
 
@@ -601,6 +626,12 @@ contract OathVault is ERC20, IUnlockCallback, ReentrancyGuardTransient {
         MANAGER.unlock(abi.encode(Action.REPOSITION, tickLower, tickUpper, swap)); // the callback returns nothing
     }
 
+    /// @dev Removes the whole position in one `unlock` of the PoolManager (`_onUnwind`).
+    function _unwind() private {
+        // forge-lint: disable-next-item(reentrancy-no-eth,unused-return)
+        MANAGER.unlock(abi.encode(Action.UNWIND)); // the callback returns nothing
+    }
+
     /// @dev The reposition, inside the unlock:
     ///      1. If the vault has a position, remove all of it. The credit is principal plus all uncollected fees.
     ///      2. If `swap.amountSpecified != 0`, swap; exact input only (`amountSpecified < 0`), else
@@ -615,23 +646,9 @@ contract OathVault is ERC20, IUnlockCallback, ReentrancyGuardTransient {
     ///      more than `maxIntraBlockTicks` within the block, including through the curator's own swap.
     function _onReposition(int24 tickLower, int24 tickUpper, IOathVault.SwapIntent memory swap) private {
         // The PoolManager is trusted and every entry point holds the vault's reentrancy lock, so the position is
-        // safely stored after the calls below. `callerDelta` already includes the fees, so `feesAccrued` is unused.
+        // safely stored after the calls below.
         PoolKey memory key = poolKey();
-        BalanceDelta delta;
-        uint128 liquidity = positionLiquidity;
-        if (liquidity > 0) {
-            // forge-lint: disable-next-item(reentrancy-no-eth,unused-return)
-            (delta,) = MANAGER.modifyLiquidity(
-                key,
-                ModifyLiquidityParams({
-                    tickLower: positionLower,
-                    tickUpper: positionUpper,
-                    liquidityDelta: -int256(uint256(liquidity)),
-                    salt: POSITION_SALT
-                }),
-                ""
-            );
-        }
+        BalanceDelta delta = _removePosition(key);
         if (swap.amountSpecified != 0) {
             if (swap.amountSpecified > 0) revert IOathVault.ExactInputOnly();
             // forge-lint: disable-next-item(reentrancy-no-eth)
@@ -676,6 +693,32 @@ contract OathVault is ERC20, IUnlockCallback, ReentrancyGuardTransient {
         positionLiquidity = newLiquidity;
     }
 
+    /// @dev Removes the vault's whole position from the pool, inside the unlock (settlement step 7):
+    ///      principal and all uncollected fees, including any earned after `E`, become idle; `L_v = 0`. The range
+    ///      is kept as the last position's. The hook's guard runs on the removal.
+    function _onUnwind() private {
+        _settle(_removePosition(poolKey()));
+        positionLiquidity = 0;
+    }
+
+    /// @dev Removes all of the vault's liquidity, if it has any. The returned credit is principal plus all
+    ///      uncollected fees (`callerDelta` already includes them, so `feesAccrued` is unused).
+    function _removePosition(PoolKey memory key) private returns (BalanceDelta delta) {
+        uint128 liquidity = positionLiquidity;
+        if (liquidity == 0) return delta;
+        // forge-lint: disable-next-item(reentrancy-no-eth,unused-return)
+        (delta,) = MANAGER.modifyLiquidity(
+            key,
+            ModifyLiquidityParams({
+                tickLower: positionLower,
+                tickUpper: positionUpper,
+                liquidityDelta: -int256(uint256(liquidity)),
+                salt: POSITION_SALT
+            }),
+            ""
+        );
+    }
+
     /// @dev Clears the vault's deltas with the PoolManager: takes each credit into the vault and pays each debt
     ///      from the vault's balance.
     function _settle(BalanceDelta delta) private {
@@ -704,6 +747,8 @@ contract OathVault is ERC20, IUnlockCallback, ReentrancyGuardTransient {
         int256 cumulative = HOOK.cumulativeNow(poolKey());
         openSince = nowTs;
         cumAtOpen = cumulative;
+        // Reached from `settle` after its trusted hook and PoolManager calls, under the reentrancy lock.
+        // forge-lint: disable-next-line(reentrancy-events)
         emit IOathVault.OpenWindowRefreshed(nowTs, cumulative);
     }
 

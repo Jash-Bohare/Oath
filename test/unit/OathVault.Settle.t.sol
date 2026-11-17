@@ -62,6 +62,59 @@ contract OathVaultSettleTest is OathVaultTestBase {
         assertEq(r.navStart, NAV_START);
     }
 
+    // ---------------------------------------------------------------- unwind and reopen
+
+    /// @dev Settlement removes the whole position (principal and fees become idle), closes the hook's epoch and
+    ///      reopens the vault with a new open window from now. It cannot settle twice, deposits and withdrawals work
+    ///      again, and the next epoch can start once the new window reaches `W`.
+    function test_settle_unwindsAndReopens() public {
+        _begin(RANGE_LOWER, RANGE_UPPER);
+        _swapAroundStart(4);
+        _toEnd();
+        assertGt(_poolPositionLiquidity(RANGE_LOWER, RANGE_UPPER), 0);
+
+        // The unwind does not move the price, so the cumulative at T0 is the one readable now.
+        int256 cumulativeAtSettle = hook.cumulativeNow(key);
+        vm.expectEmit(false, false, false, true, address(vault));
+        emit IOathVault.OpenWindowRefreshed(uint32(endsAt), cumulativeAtSettle);
+        _settleAs(keeper);
+
+        // Unwound: nothing left in the pool, everything idle (the bond untouched as tokens).
+        (int24 lower, int24 upper, uint128 liquidity) = vault.positionInfo();
+        assertEq(liquidity, 0, "L_v = 0");
+        assertEq(lower, RANGE_LOWER, "last range kept");
+        assertEq(upper, RANGE_UPPER);
+        assertEq(_poolPositionLiquidity(RANGE_LOWER, RANGE_UPPER), 0, "position removed from the pool");
+        assertEq(c1.balanceOf(address(vault)), vault.idle1() + vault.bondBalance());
+
+        // Hook epoch closed; vault OPEN with T0 = now.
+        assertFalse(hook.epochData(key).active, "hook epoch closed");
+        assertEq(uint8(vault.state()), uint8(IOathVault.State.OPEN));
+        assertEq(vault.openSince(), endsAt, "T0 = settlement time");
+        assertEq(vault.cumAtOpen(), cumulativeAtSettle, "cumAtOpen = hook cumulative at T0");
+        assertFalse(vault.isSettleable());
+        vm.expectRevert(IOathVault.NotActive.selector);
+        _settleAs(keeper);
+
+        // Open-window actions work again.
+        uint256 shares = vault.balanceOf(alice) / 2;
+        vm.prank(alice);
+        vault.withdraw(shares, 0, 0, alice);
+        vm.prank(curator);
+        vault.withdrawBond(1);
+
+        // And a second epoch starts after W.
+        vm.warp(endsAt + 30 minutes - 1);
+        vm.expectRevert(IOathVault.OpenWindowTooShort.selector);
+        _startEpoch(RANGE_LOWER, RANGE_UPPER, _noSwap());
+        vm.warp(endsAt + 30 minutes);
+        _postBond(1);
+        _startEpoch(RANGE_LOWER, RANGE_UPPER, _noSwap());
+        assertEq(uint8(vault.state()), uint8(IOathVault.State.ACTIVE));
+        assertTrue(hook.epochData(key).active, "hook epoch reopened");
+        assertEq(vault.epochCount(), 1, "one settled epoch");
+    }
+
     // ---------------------------------------------------------------- preconditions
 
     /// @dev Not before `E`: one second earlier reverts; `isSettleable` flips exactly at `E`.
