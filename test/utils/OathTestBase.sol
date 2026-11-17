@@ -151,6 +151,16 @@ abstract contract OathTestBase is Deployers {
         );
     }
 
+    /// @notice Moves `key`'s pool to exactly `tick` (see `_moveTo`).
+    function _moveToTick(int24 tick) internal {
+        _moveTo(key, TickMath.getSqrtPriceAtTick(tick));
+    }
+
+    /// @notice The current tick of `key`'s pool.
+    function _tick() internal view returns (int24 tick) {
+        (, tick,,) = manager.getSlot0(key.toId());
+    }
+
     /// @dev Live block values. Under via_ir the optimizer may treat `block.timestamp` and `block.number` as
     ///      constant within the test's transaction, so after `vm.warp`/`vm.roll` read them through the cheatcodes.
     function _time() internal view returns (uint256) {

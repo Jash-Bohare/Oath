@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: MIT
 pragma solidity 0.8.26;
 
+import {IHooks} from "@uniswap/v4-core/src/interfaces/IHooks.sol";
 import {IPoolManager} from "@uniswap/v4-core/src/interfaces/IPoolManager.sol";
 import {StateLibrary} from "@uniswap/v4-core/src/libraries/StateLibrary.sol";
 import {TickMath} from "@uniswap/v4-core/src/libraries/TickMath.sol";
@@ -10,6 +11,7 @@ import {PoolId} from "@uniswap/v4-core/src/types/PoolId.sol";
 import {IOathHook} from "../../src/interfaces/IOathHook.sol";
 import {IOathVault} from "../../src/interfaces/IOathVault.sol";
 import {BenchmarkLib} from "../../src/libraries/BenchmarkLib.sol";
+import {ValuationLib} from "../../src/libraries/ValuationLib.sol";
 import {OathVault} from "../../src/OathVault.sol";
 import {OathHookTestBase} from "../utils/OathHookTestBase.sol";
 import {OathVaultTestBase} from "../utils/OathVaultTestBase.sol";
@@ -256,5 +258,424 @@ contract OathVaultStartEpochTest is OathVaultTestBase {
         assertTrue(e.active, "hook epoch active");
         assertEq(e.checkpointA, end - 30 minutes, "checkpoint A = E - W");
         assertEq(e.checkpointB, end, "checkpoint B = E");
+    }
+
+    // ---------------------------------------------------------------- access and range
+
+    function testFuzz_start_onlyCurator(address caller) public {
+        vm.assume(caller != curator);
+        _seedPool(POOL_LIQUIDITY);
+        _fundWorkedExample();
+        _wait(1 hours);
+        vm.prank(caller);
+        vm.expectRevert(IOathVault.NotCurator.selector);
+        vault.startEpoch(RANGE_LOWER, RANGE_UPPER, _noSwap());
+    }
+
+    /// @dev An epoch cannot start while one is running.
+    function test_start_notTwice() public {
+        _startWorkedExample();
+        _wait(1 hours);
+        vm.expectRevert(IOathVault.NotOpen.selector);
+        _startEpoch(RANGE_LOWER, RANGE_UPPER, _noSwap());
+    }
+
+    /// @dev `tickLower < tickUpper`, both on the tick spacing, both within the usable ticks.
+    function test_start_badRange() public {
+        _seedPool(POOL_LIQUIDITY);
+        _fundWorkedExample();
+        _wait(1 hours);
+        (int24 tickMin, int24 tickMax) = _fullRange();
+        int24[2][6] memory bad = [
+            [RANGE_LOWER, RANGE_LOWER], // empty
+            [RANGE_UPPER, RANGE_LOWER], // reversed
+            [RANGE_LOWER - 5, RANGE_UPPER], // lower off the spacing
+            [RANGE_LOWER, RANGE_UPPER + 5], // upper off the spacing
+            [tickMin - TICK_SPACING, RANGE_UPPER], // below the usable ticks
+            [RANGE_LOWER, tickMax + TICK_SPACING] // above the usable ticks
+        ];
+        for (uint256 i; i < bad.length; ++i) {
+            vm.expectRevert(IOathVault.BadRange.selector);
+            _startEpoch(bad[i][0], bad[i][1], _noSwap());
+        }
+    }
+
+    /// @dev The widest legal range is the full usable range.
+    function test_start_fullRangeAllowed() public {
+        _seedPool(POOL_LIQUIDITY);
+        _fundWorkedExample();
+        _wait(1 hours);
+        (int24 tickMin, int24 tickMax) = _fullRange();
+        _startEpoch(tickMin, tickMax, _noSwap());
+        (int24 lower, int24 upper, uint128 liquidity) = vault.positionInfo();
+        assertEq(lower, tickMin);
+        assertEq(upper, tickMax);
+        assertEq(_poolPositionLiquidity(tickMin, tickMax), liquidity);
+    }
+
+    // ---------------------------------------------------------------- open window
+
+    /// @dev `W ≤ now − T0`: one second short of `W` reverts.
+    function test_start_openWindowTooShort() public {
+        _seedPool(POOL_LIQUIDITY);
+        _fundWorkedExample();
+        vm.warp(createdAt + 30 minutes - 1);
+        vm.expectRevert(IOathVault.OpenWindowTooShort.selector);
+        _startEpoch(RANGE_LOWER, RANGE_UPPER, _noSwap());
+    }
+
+    /// @dev Exactly `W` is enough.
+    function test_start_atMinimumWindow() public {
+        _seedPool(POOL_LIQUIDITY);
+        _fundWorkedExample();
+        vm.warp(createdAt + 30 minutes);
+        _startEpoch(RANGE_LOWER, RANGE_UPPER, _noSwap());
+        assertEq(uint8(vault.state()), uint8(IOathVault.State.ACTIVE));
+    }
+
+    /// @dev Exactly `maxOpen` is still allowed.
+    function test_start_atMaximumWindow() public {
+        _seedPool(POOL_LIQUIDITY);
+        _fundWorkedExample();
+        vm.warp(createdAt + 6 hours);
+        _startEpoch(RANGE_LOWER, RANGE_UPPER, _noSwap());
+        assertEq(uint8(vault.state()), uint8(IOathVault.State.ACTIVE));
+    }
+
+    /// @dev `now − T0 ≤ maxOpen`: one second over reverts.
+    function test_start_openWindowExpired() public {
+        _seedPool(POOL_LIQUIDITY);
+        _fundWorkedExample();
+        vm.warp(createdAt + 6 hours + 1);
+        vm.expectRevert(IOathVault.OpenWindowExpired.selector);
+        _startEpoch(RANGE_LOWER, RANGE_UPPER, _noSwap());
+    }
+
+    /// @dev After a refresh the window restarts: `W` must pass again, and the start TWAP covers only the new
+    ///      window (the price moved during the expired one).
+    function test_start_afterRefreshUsesNewWindow() public {
+        _seedPool(POOL_LIQUIDITY);
+        _fundWorkedExample();
+        _nextBlock(1 hours);
+        _moveToTick(START_TICK - 300); // held for the rest of the expired window only
+        _nextBlock(0);
+        _moveToTick(START_TICK);
+        vm.warp(createdAt + 6 hours + 1);
+        vault.refreshOpenWindow();
+        uint256 refreshedAt = _time();
+
+        vm.warp(refreshedAt + 30 minutes - 1);
+        vm.expectRevert(IOathVault.OpenWindowTooShort.selector);
+        _startEpoch(RANGE_LOWER, RANGE_UPPER, _noSwap());
+
+        _nextBlock(1);
+        _startEpoch(RANGE_LOWER, RANGE_UPPER, _noSwap());
+        (,,,,,, int24 startTick) = vault.benchmark();
+        assertEq(startTick, START_TICK, "TWAP over the new window only");
+    }
+
+    // ---------------------------------------------------------------- start price
+
+    /// @dev The start price is the TWAP over the whole open window (MATH.md §5), equal to a brute-force sum of
+    ///      tick × seconds held, floor-divided by the window. Moving the spot price just before `startEpoch` (here
+    ///      1,150 ticks, one block earlier) barely moves it. The cumulative is negative with a remainder, so
+    ///      flooring differs from truncation. The benchmark is created at that price with the fee growth at `S`.
+    function test_start_usesOpenWindowTwap() public {
+        _seedPool(POOL_LIQUIDITY);
+        (uint256 x, uint256 y) = _depositWorkedExample();
+        _postBond(2 * BOND); // the start NAV moves with the TWAP; keep the bond check out of the way
+
+        int256 cumulative = int256(START_TICK) * 600;
+        _nextBlock(600);
+        _moveToTick(START_TICK - 104);
+        int24 t1 = _tick();
+        _nextBlock(900);
+        _moveToTick(START_TICK + 46);
+        int24 t2 = _tick();
+        _nextBlock(1500);
+        _moveToTick(START_TICK + 1196); // spot moved far just before the start
+        int24 t3 = _tick();
+        _nextBlock(7);
+        cumulative += int256(t1) * 900 + int256(t2) * 1500 + int256(t3) * 7;
+        uint32 elapsed = 600 + 900 + 1500 + 7;
+        assertEq(_time(), createdAt + elapsed);
+        assertEq(hook.cumulativeNow(key) - vault.cumAtOpen(), cumulative, "hook cumulative = brute force");
+
+        int256 floorTick = cumulative / int256(uint256(elapsed));
+        assertTrue(cumulative < 0 && cumulative % int256(uint256(elapsed)) != 0, "floor differs from truncation");
+        floorTick -= 1;
+        (uint256 g0, uint256 g1) = manager.getFeeGrowthGlobals(key.toId());
+        assertGt(g0, 0, "swaps paid fees");
+
+        _startEpoch(-198100, -197900, _noSwap()); // around the spot tick -198000
+        (uint128 benchL,,, uint256 bg0, uint256 bg1, uint256 navStart, int24 startTick) = vault.benchmark();
+        assertEq(startTick, int24(floorTick), "start tick = floor of the brute-force TWAP");
+        assertTrue(startTick != t3, "not the spot tick");
+        uint160 sqrtStart = TickMath.getSqrtPriceAtTick(startTick);
+        assertEq(navStart, ValuationLib.value(x, y, sqrtStart), "navStart = idle deposit marked at the TWAP");
+        (uint128 expectedL,,) = BenchmarkLib.create(navStart, sqrtStart, TICK_SPACING);
+        assertEq(benchL, expectedL, "benchmark created at the TWAP");
+        assertEq(bg0, g0, "G0 at S");
+        assertEq(bg1, g1, "G1 at S");
+    }
+
+    // ---------------------------------------------------------------- start value, cap and bond
+
+    /// @dev A vault with nothing to manage cannot start (the bond is not part of the NAV).
+    function test_start_emptyVault() public {
+        _seedPool(POOL_LIQUIDITY);
+        _postBond(BOND);
+        _wait(1 hours);
+        vm.expectRevert(IOathVault.EmptyVault.selector);
+        _startEpoch(RANGE_LOWER, RANGE_UPPER, _noSwap());
+    }
+
+    /// @dev Cap `L_b ≤ activeLiquidity · capBps / 10,000` (MATH.md §10), inclusive: at `400·L_b − 1` the limit
+    ///      floors to `L_b − 1` and the start reverts; one more unit of pool liquidity and it passes.
+    function test_start_capBoundary() public {
+        (uint128 benchL,,) = BenchmarkLib.create(NAV_START, TickMath.getSqrtPriceAtTick(START_TICK), TICK_SPACING);
+        _seedPool(uint256(benchL) * 400 - 1);
+        _fundWorkedExample();
+        _wait(1 hours);
+        vm.expectRevert(IOathVault.VaultTooLarge.selector);
+        _startEpoch(RANGE_LOWER, RANGE_UPPER, _noSwap());
+
+        _seedPool(1);
+        assertEq(manager.getLiquidity(key.toId()), uint256(benchL) * 400);
+        _startEpoch(RANGE_LOWER, RANGE_UPPER, _noSwap());
+        (uint128 l,,,,,,) = vault.benchmark();
+        assertEq(l, benchL);
+    }
+
+    /// @dev Bond `≥ navStart · minBondBps / 10,000` (MATH.md §10), inclusive: $2,999.999999 against a $30,000
+    ///      start reverts; one more raw unit makes exactly 10% and passes.
+    function test_start_bondBoundary() public {
+        _seedPool(POOL_LIQUIDITY);
+        _depositWorkedExample();
+        _postBond(BOND - 1);
+        _wait(1 hours);
+        vm.expectRevert(IOathVault.BondTooSmall.selector);
+        _startEpoch(RANGE_LOWER, RANGE_UPPER, _noSwap());
+
+        _postBond(1);
+        _startEpoch(RANGE_LOWER, RANGE_UPPER, _noSwap());
+        assertEq(vault.bondBalance(), BOND);
+    }
+
+    /// @dev The cap is checked before the bond.
+    function test_start_capCheckedBeforeBond() public {
+        _seedPool(1e9);
+        _depositWorkedExample();
+        _wait(1 hours);
+        vm.expectRevert(IOathVault.VaultTooLarge.selector);
+        _startEpoch(RANGE_LOWER, RANGE_UPPER, _noSwap());
+    }
+
+    // ---------------------------------------------------------------- reposition at start
+
+    /// @dev Someone moves the price more than `maxIntraBlockTicks` (50) earlier in the same block: the vault's
+    ///      liquidity add hits the hook's guard and the whole start reverts.
+    function test_start_guardBlocksSameBlockMove() public {
+        _seedPool(POOL_LIQUIDITY);
+        _fundWorkedExample();
+        _nextBlock(1 hours);
+        _moveToTick(START_TICK + 51);
+        vm.expectRevert(
+            _hookError(
+                IHooks.beforeAddLiquidity.selector,
+                abi.encodeWithSelector(IOathHook.PriceMovedThisBlock.selector, START_TICK + 51, START_TICK)
+            )
+        );
+        _startEpoch(RANGE_LOWER, RANGE_UPPER, _noSwap());
+    }
+
+    /// @dev A same-block move of exactly `maxIntraBlockTicks` is allowed.
+    function test_start_guardAllowsMoveAtBound() public {
+        _seedPool(POOL_LIQUIDITY);
+        _fundWorkedExample();
+        _nextBlock(1 hours);
+        _moveToTick(START_TICK + 50);
+        _startEpoch(RANGE_LOWER, RANGE_UPPER, _noSwap());
+        assertEq(uint8(vault.state()), uint8(IOathVault.State.ACTIVE));
+    }
+
+    /// @dev The curator's exact-input swap runs before the liquidity is added. The benchmark keeps the fee
+    ///      growth from before it (the start mark is taken first) and the start NAV is the pre-swap value.
+    function test_start_withSwap() public {
+        _seedPool(POOL_LIQUIDITY);
+        (uint256 x,) = _fundWorkedExample();
+        _wait(1 hours);
+        _startEpoch(
+            RANGE_LOWER,
+            RANGE_UPPER,
+            IOathVault.SwapIntent({
+                zeroForOne: true, amountSpecified: -1e18, sqrtPriceLimitX96: TickMath.MIN_SQRT_PRICE + 1
+            })
+        );
+        (uint256 g0,) = manager.getFeeGrowthGlobals(key.toId());
+        assertGt(g0, 0, "the curator's swap paid fees");
+        (,,, uint256 bg0, uint256 bg1, uint256 navStart,) = vault.benchmark();
+        assertEq(bg0, 0, "G0 at S excludes the curator's own swap");
+        assertEq(bg1, 0);
+        assertEq(navStart, NAV_START);
+        assertLt(_tick(), START_TICK, "price moved down");
+
+        (,, uint128 liquidity) = vault.positionInfo();
+        assertGt(liquidity, 0);
+        assertEq(_poolPositionLiquidity(RANGE_LOWER, RANGE_UPPER), liquidity);
+        assertLt(vault.idle0(), x - 1e18, "swapped and added currency0");
+        assertEq(vault.bondBalance(), BOND);
+    }
+
+    /// @dev Exact output (`amountSpecified > 0`) is rejected.
+    function test_start_exactInputOnly() public {
+        _seedPool(POOL_LIQUIDITY);
+        _fundWorkedExample();
+        _wait(1 hours);
+        vm.expectRevert(IOathVault.ExactInputOnly.selector);
+        _startEpoch(
+            RANGE_LOWER,
+            RANGE_UPPER,
+            IOathVault.SwapIntent({
+                zeroForOne: true, amountSpecified: 1, sqrtPriceLimitX96: TickMath.MIN_SQRT_PRICE + 1
+            })
+        );
+    }
+
+    /// @dev A swap that needs one raw unit more currency1 than the idle balance would spend the bond: reverts.
+    function test_start_swapCannotSpendBond() public {
+        _seedPool(POOL_LIQUIDITY);
+        (, uint256 y) = _fundWorkedExample();
+        _wait(1 hours);
+        vm.expectRevert(IOathVault.BondTouched.selector);
+        _startEpoch(
+            RANGE_LOWER,
+            RANGE_UPPER,
+            IOathVault.SwapIntent({
+                zeroForOne: false, amountSpecified: -int256(y + 1), sqrtPriceLimitX96: TickMath.MAX_SQRT_PRICE - 1
+            })
+        );
+    }
+
+    /// @dev Swapping all idle currency1 leaves nothing to pair with currency0 in an in-range position, so no
+    ///      liquidity is added: the epoch still starts, with the range stored and `L_v = 0`. The hook's recorded
+    ///      range stays unset, which is harmless with `L_v = 0` (the snapshot's fee growth is multiplied by 0).
+    function test_start_zeroLiquidityPosition() public {
+        _seedPool(POOL_LIQUIDITY);
+        (uint256 x, uint256 y) = _fundWorkedExample();
+        _wait(1 hours);
+        _startEpoch(
+            RANGE_LOWER,
+            RANGE_UPPER,
+            IOathVault.SwapIntent({
+                zeroForOne: false, amountSpecified: -int256(y), sqrtPriceLimitX96: TickMath.MAX_SQRT_PRICE - 1
+            })
+        );
+        assertGt(_tick(), START_TICK);
+        assertLt(_tick(), RANGE_UPPER, "still in range");
+
+        (int24 lower, int24 upper, uint128 liquidity) = vault.positionInfo();
+        assertEq(lower, RANGE_LOWER);
+        assertEq(upper, RANGE_UPPER);
+        assertEq(liquidity, 0, "L_v = 0");
+        assertEq(_poolPositionLiquidity(RANGE_LOWER, RANGE_UPPER), 0);
+        (,, int24 vaultLower, int24 vaultUpper) = hook.configs(key.toId());
+        assertEq(vaultLower, 0);
+        assertEq(vaultUpper, 0);
+        assertEq(vault.idle1(), 0, "all currency1 swapped");
+        assertGt(vault.idle0(), x, "currency0 bought");
+        assertEq(uint8(vault.state()), uint8(IOathVault.State.ACTIVE));
+        assertEq(vault.bondBalance(), BOND);
+    }
+
+    /// @dev Whatever the range and swap (within the idle balance), a start never spends the bond, and the pool
+    ///      holds exactly the recorded `L_v` under the vault's salt.
+    function testFuzz_start_neverSpendsBond(bool zeroForOne, uint256 amountIn, int256 lowerSeed, uint256 width) public {
+        _seedPool(POOL_LIQUIDITY);
+        (uint256 x, uint256 y) = _fundWorkedExample();
+        _wait(1 hours);
+        amountIn = bound(amountIn, 1, zeroForOne ? x : y); // at most ~41 ticks of impact, inside the guard
+        int24 lower = int24(bound(lowerSeed, -2_010, -1_970)) * TICK_SPACING * 10;
+        int24 upper = lower + int24(int256(bound(width, 1, 400))) * TICK_SPACING;
+
+        _startEpoch(
+            lower,
+            upper,
+            IOathVault.SwapIntent({
+                zeroForOne: zeroForOne,
+                amountSpecified: -int256(amountIn),
+                sqrtPriceLimitX96: zeroForOne ? TickMath.MIN_SQRT_PRICE + 1 : TickMath.MAX_SQRT_PRICE - 1
+            })
+        );
+        assertEq(vault.bondBalance(), BOND, "bond balance");
+        assertEq(c1.balanceOf(address(vault)), vault.idle1() + BOND, "bond tokens still held");
+        (,, uint128 liquidity) = vault.positionInfo();
+        assertEq(_poolPositionLiquidity(lower, upper), liquidity, "pool position = L_v");
+    }
+
+    /// @dev Native ETH as currency0: the curator's ETH swap and the liquidity add are both paid in ETH.
+    function test_start_nativeEth() public {
+        _createVault(CurrencyLibrary.ADDRESS_ZERO);
+        uint256 openedAt = _time();
+        _seedPool(POOL_LIQUIDITY);
+        (uint256 x,) = _fundWorkedExample();
+        vm.warp(openedAt + 1 hours);
+        _startEpoch(
+            RANGE_LOWER,
+            RANGE_UPPER,
+            IOathVault.SwapIntent({
+                zeroForOne: true, amountSpecified: -1e18, sqrtPriceLimitX96: TickMath.MIN_SQRT_PRICE + 1
+            })
+        );
+        (,, uint128 liquidity) = vault.positionInfo();
+        assertGt(liquidity, 0);
+        assertEq(_poolPositionLiquidity(RANGE_LOWER, RANGE_UPPER), liquidity);
+        assertEq(vault.idle0(), address(vault).balance);
+        assertLt(vault.idle0(), x - 1e18);
+        assertEq(vault.bondBalance(), BOND);
+    }
+}
+
+/// @notice The hook's guard also bounds the curator's own swap at `startEpoch`. A tighter `maxIntraBlockTicks`
+///         (10) keeps the swap within what the worked-example vault can pay.
+contract OathVaultStartSwapBoundTest is OathVaultTestBase {
+    function setUp() public override {
+        super.setUp();
+        IOathVault.VaultParams memory p = _defaultParams();
+        p.maxIntraBlockTicks = 10;
+        _createVault(currency0, p);
+        _seedPool(POOL_LIQUIDITY);
+        _fundWorkedExample();
+        _wait(1 hours);
+    }
+
+    /// @dev Swapping the price up 11 ticks, one more than the guard allows: the add reverts.
+    function test_start_ownSwapBeyondGuardReverts() public {
+        IOathVault.SwapIntent memory swap = _swapUpTo(START_TICK + 11);
+        vm.expectRevert(
+            _hookError(
+                IHooks.beforeAddLiquidity.selector,
+                abi.encodeWithSelector(IOathHook.PriceMovedThisBlock.selector, START_TICK + 11, START_TICK)
+            )
+        );
+        _startEpoch(RANGE_LOWER, RANGE_UPPER, swap);
+    }
+
+    /// @dev Exactly 10 ticks is allowed.
+    function test_start_ownSwapAtGuardBound() public {
+        _startEpoch(RANGE_LOWER, RANGE_UPPER, _swapUpTo(START_TICK + 10));
+        (, int24 tick,,) = StateLibrary.getSlot0(manager, key.toId());
+        assertEq(tick, START_TICK + 10);
+        (,, uint128 liquidity) = vault.positionInfo();
+        assertGt(liquidity, 0);
+    }
+
+    /// @dev Exact-input currency1 swap stopped by the price limit at `tick`.
+    function _swapUpTo(int24 tick) internal view returns (IOathVault.SwapIntent memory) {
+        return IOathVault.SwapIntent({
+            zeroForOne: false,
+            amountSpecified: -int256(vault.idle1()),
+            sqrtPriceLimitX96: TickMath.getSqrtPriceAtTick(tick)
+        });
     }
 }

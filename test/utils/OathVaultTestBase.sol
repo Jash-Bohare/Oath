@@ -45,6 +45,11 @@ abstract contract OathVaultTestBase is OathTestBase {
 
     /// @dev Creates the vault for `currency0_`/`currency1` with the default parameters through the factory.
     function _createVault(Currency currency0_) internal {
+        _createVault(currency0_, _defaultParams());
+    }
+
+    /// @dev Creates the vault for `currency0_`/`currency1` with `params` through the factory.
+    function _createVault(Currency currency0_, IOathVault.VaultParams memory params) internal {
         vault = OathVault(
             payable(factory.createVault(
                     currency0_,
@@ -53,7 +58,7 @@ abstract contract OathVaultTestBase is OathTestBase {
                     TICK_SPACING,
                     TickMath.getSqrtPriceAtTick(START_TICK),
                     curator,
-                    _defaultParams()
+                    params
                 ))
         );
         key = vault.poolKey();
@@ -110,12 +115,26 @@ abstract contract OathVaultTestBase is OathTestBase {
     ///      start tick) and the currency1 that brings the vault to exactly `NAV_START` at that tick; the curator
     ///      posts `BOND`. Returns the deposit.
     function _fundWorkedExample() internal returns (uint256 x, uint256 y) {
+        (x, y) = _depositWorkedExample();
+        _postBond(BOND);
+    }
+
+    /// @dev The deposit of `_fundWorkedExample`, without the bond.
+    function _depositWorkedExample() internal returns (uint256 x, uint256 y) {
         uint160 sqrtP = TickMath.getSqrtPriceAtTick(START_TICK);
         (x,) = BenchmarkLib.split(NAV_START, sqrtP);
         y = NAV_START - ValuationLib.value(x, 0, sqrtP);
         _give(alice, x, y);
         _deposit(alice, x, y);
-        _postBond(BOND);
+    }
+
+    /// @dev The worked-example epoch: real pool depth, the §9.1 deposit and bond, a 1-hour open window with no
+    ///      swaps (start TWAP = start tick), then the curator starts on [−199400, −199000) without a swap.
+    function _startWorkedExample() internal {
+        _seedPool(POOL_LIQUIDITY);
+        _fundWorkedExample();
+        _wait(1 hours);
+        _startEpoch(RANGE_LOWER, RANGE_UPPER, _noSwap());
     }
 
     /// @dev The curator posts `amount` currency1 of bond (funded here).

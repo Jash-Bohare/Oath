@@ -92,12 +92,4 @@ abstract contract OathHookTestBase is OathTestBase {
         vm.prank(vault);
         hook.openEpoch(key, epochEnd, twapWindow);
     }
-
-    function _moveToTick(int24 tick) internal {
-        _moveTo(key, TickMath.getSqrtPriceAtTick(tick));
-    }
-
-    function _tick() internal view returns (int24 tick) {
-        (, tick,,) = manager.getSlot0(id);
-    }
 }
