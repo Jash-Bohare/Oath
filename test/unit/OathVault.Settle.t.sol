@@ -456,6 +456,64 @@ contract OathVaultSettleTest is OathVaultTestBase {
         assertEq(diff, r.diff, "difference");
     }
 
+    /// @dev The raw public getters agree with the views built on them: the position fields with `positionInfo()`
+    ///      (while ACTIVE and after the unwind), and `results(i)` with `getResult(i)`.
+    function test_settle_publicGettersMatchViews() public {
+        _begin(RANGE_LOWER, RANGE_UPPER);
+        (int24 lower, int24 upper, uint128 liquidity) = vault.positionInfo();
+        assertGt(liquidity, 0);
+        assertEq(vault.positionLower(), lower);
+        assertEq(vault.positionUpper(), upper);
+        assertEq(vault.positionLiquidity(), liquidity);
+
+        _swapAroundStart(2);
+        _toEnd();
+        _settleAs(keeper);
+        assertEq(vault.positionLiquidity(), 0, "unwound");
+        IOathVault.EpochResult memory r = vault.getResult(0);
+        (
+            uint32 start,
+            uint32 end,
+            int24 startTick,
+            int24 endTick,
+            uint256 navStart,
+            uint256 navEnd,
+            uint256 benchEnd,,,,,,,,,,
+        ) = vault.results(0);
+        assertEq(
+            abi.encode(start, end, startTick, endTick, navStart, navEnd, benchEnd),
+            abi.encode(r.start, r.end, r.startTick, r.endTick, r.navStart, r.navEnd, r.benchEnd)
+        );
+        (
+            ,,,,,,,
+            int256 diff,
+            uint256 band,
+            uint256 payout,
+            uint256 fee,
+            uint256 feeShares,
+            uint256 bondAfter,
+            uint256 benchFees0,
+            uint256 benchFees1,
+            uint256 vaultFees0,
+            uint256 vaultFees1
+        ) = vault.results(0);
+        assertEq(
+            abi.encode(diff, band, payout, fee, feeShares, bondAfter, benchFees0, benchFees1, vaultFees0, vaultFees1),
+            abi.encode(
+                r.diff,
+                r.band,
+                r.payout,
+                r.fee,
+                r.feeShares,
+                r.bondAfter,
+                r.benchFees0,
+                r.benchFees1,
+                r.vaultFees0,
+                r.vaultFees1
+            )
+        );
+    }
+
     // ---------------------------------------------------------------- preconditions
 
     /// @dev Not before `E`: one second earlier reverts; `isSettleable` flips exactly at `E`.
