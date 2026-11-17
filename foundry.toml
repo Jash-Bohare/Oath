@@ -33,5 +33,6 @@ mainnet = "${ETH_RPC_URL}"
 line_length = 120
 
 [lint]
-# Lint production code; tests intentionally use repeated literals, loops and ignored router returns.
-ignore = ["test/**/*.sol"]
+# Lint production code; tests and the demo scripts (simulation-only fork tooling) intentionally use repeated
+# literals, loops, cheatcodes and ignored router returns.
+ignore = ["test/**/*.sol", "script/**/*.sol"]
