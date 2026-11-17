@@ -36,10 +36,14 @@ contract OathHook is BaseHook, IOathHook {
     /// @dev `BaseHook` reverts unless this contract's address carries exactly the permission flags below.
     ///      No zero check on `factory_`: a hook with a zero factory can never register a vault, so it can
     ///      never get a pool, and the factory's constructor checks `hook.factory() == address(this)`.
+    // Slither: no zero check, as explained in the @dev above.
+    // slither-disable-start missing-zero-check
     // forge-lint: disable-next-line(missing-zero-check)
     constructor(IPoolManager manager, address factory_) BaseHook(manager) {
         factory = factory_;
     }
+
+    // slither-disable-end missing-zero-check
 
     /// @notice The hook's permissions: beforeInitialize, beforeAddLiquidity, beforeRemoveLiquidity,
     ///         beforeSwap and beforeDonate. Everything else, including every `*ReturnsDelta`, is false.
@@ -134,6 +138,8 @@ contract OathHook is BaseHook, IOathHook {
     ///         every swap advances the accumulator first.
     /// @param key The pool key.
     /// @return The cumulative Σ tick·dt up to `block.timestamp`.
+    // Slither: only the tick is needed from `getSlot0`.
+    // slither-disable-next-line unused-return
     function cumulativeNow(PoolKey calldata key) external view returns (int256) {
         PoolId id = key.toId();
         (, int24 tick,,) = poolManager.getSlot0(id);
@@ -233,6 +239,8 @@ contract OathHook is BaseHook, IOathHook {
     ///      current tick is the block-start tick (only swaps move the price) and the check passes. This blocks a
     ///      sandwich of the vault's reposition or unwind within one block, and bounds the price impact of the
     ///      curator's own rebalance swap.
+    // Slither: only the tick is needed from `getSlot0`.
+    // slither-disable-next-line unused-return
     function _guard(PoolId id, int24 maxIntraBlockTicks) private view {
         IOathHook.Oracle storage o = oracles[id];
         if (o.lastSwapBlock != block.number) return;
@@ -252,6 +260,8 @@ contract OathHook is BaseHook, IOathHook {
     ///      therefore recorded exactly, not interpolated, and before the accumulator moves past it.
     /// @return id The pool id.
     /// @return tick The current tick, which held since `lastTimestamp`.
+    // Slither: only the tick is needed from `getSlot0`.
+    // slither-disable-next-line unused-return
     function _advance(PoolKey calldata key) private returns (PoolId id, int24 tick) {
         id = key.toId();
         (, tick,,) = poolManager.getSlot0(id);

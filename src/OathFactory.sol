@@ -50,6 +50,9 @@ contract OathFactory is IOathFactory {
     }
 
     /// @inheritdoc IOathFactory
+    // Slither: the start tick `initialize` returns is not needed, and the event follows the calls because the vault
+    // only exists after `new` (see the body).
+    // slither-disable-next-line unused-return,reentrancy-events
     function createVault(
         Currency currency0,
         Currency currency1,

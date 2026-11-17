@@ -112,8 +112,11 @@ contract OathVault is ERC20, IUnlockCallback, ReentrancyGuardTransient, IOathVau
         IPoolManager manager_,
         IOathHook hook_,
         PoolKey memory key_,
+        // Slither: the factory rejects a zero curator (`ZeroCurator`).
+        // slither-disable-start missing-zero-check
         // forge-lint: disable-next-line(missing-zero-check)
         address curator_,
+        // slither-disable-end missing-zero-check
         IOathVault.VaultParams memory params_
     ) ERC20(_shareName(key_), _shareSymbol(key_)) {
         MANAGER = manager_;
@@ -163,6 +166,8 @@ contract OathVault is ERC20, IUnlockCallback, ReentrancyGuardTransient, IOathVau
     /// @return shares Shares minted to `receiver`.
     /// @return used0 Currency0 taken.
     /// @return used1 Currency1 taken.
+    // Slither: `supply == 0` is the first-deposit test on the share supply (only deposits and fees mint), not a balance.
+    // slither-disable-next-line incorrect-equality
     function deposit(uint256 amount0Max, uint256 amount1Max, uint256 minShares, address receiver)
         external
         payable
@@ -390,6 +395,9 @@ contract OathVault is ERC20, IUnlockCallback, ReentrancyGuardTransient, IOathVau
     ///      the block, `settle` reverts and anyone can retry in a later block. Reverts `NotActive()`,
     ///      `EpochNotEnded()`, or `IOathHook.EpochNotReady()` if the hook has not recorded both checkpoints and
     ///      the snapshot (impossible after the poke; checked anyway).
+    // Slither: state is written after the hook and PoolManager calls, in the step order above; both are trusted and
+    // this function holds the reentrancy lock.
+    // slither-disable-next-line reentrancy-no-eth,reentrancy-benign
     function settle() external nonReentrant {
         if (state != IOathVault.State.ACTIVE) revert IOathVault.NotActive();
         // Epochs are days long; validator timestamp skew of seconds is irrelevant here.
@@ -407,6 +415,8 @@ contract OathVault is ERC20, IUnlockCallback, ReentrancyGuardTransient, IOathVau
         if (!(e.snapTaken && e.doneA && e.doneB)) revert IOathHook.EpochNotReady();
 
         // 2. End price: the TWAP over the last W seconds of the epoch.
+        // Slither: zero-initialized on purpose; every field is set below.
+        // slither-disable-next-line uninitialized-local
         IOathVault.EpochResult memory r;
         r.endTick = _twapTick(e.cumB - e.cumA, TWAP_WINDOW);
         uint160 sqrtPriceEnd = TickMath.getSqrtPriceAtTick(r.endTick);
@@ -516,6 +526,8 @@ contract OathVault is ERC20, IUnlockCallback, ReentrancyGuardTransient, IOathVau
     /// @return navNow Vault NAV at spot.
     /// @return benchNow Benchmark value at spot.
     /// @return diff `navNow − benchNow`.
+    // Slither: only the price and the values are needed from these tuples.
+    // slither-disable-next-line unused-return
     function previewLive() external view returns (uint256 navNow, uint256 benchNow, int256 diff) {
         (uint160 sqrtPriceX96,,,) = MANAGER.getSlot0(POOL_ID);
         if (state == IOathVault.State.OPEN) {
@@ -590,6 +602,8 @@ contract OathVault is ERC20, IUnlockCallback, ReentrancyGuardTransient, IOathVau
     /// @dev A later deposit priced against holdings `(h0, h1)` (MATH.md §11): `shares = min_i mulDiv(supply, a_i,
     ///      h_i)` over tokens with `h_i > 0`, `used_i = mulDivUp(h_i, shares, supply) ≤ a_i`. Reverts `EmptyVault()`
     ///      if the vault holds neither token, `ZeroShares()` if the deposit is too small for one share.
+    // Slither: `shares == 0` rejects a deposit too small for one share; it is not a balance comparison.
+    // slither-disable-next-line incorrect-equality
     function _proportional(uint256 supply, uint256 a0, uint256 a1, uint256 h0, uint256 h1)
         private
         pure
@@ -608,6 +622,8 @@ contract OathVault is ERC20, IUnlockCallback, ReentrancyGuardTransient, IOathVau
     ///      snapshot at `E` for settlement, the live value for `previewLive`. The last marks are the fee growth
     ///      inside when its fees were last collected (`getPositionInfo`). With `positionLiquidity == 0` the marks
     ///      are irrelevant: fees and principal are 0.
+    // Slither: only the fee-growth marks are needed from `getPositionInfo`.
+    // slither-disable-next-line unused-return
     function _positionMarkedAt(uint256 mark0, uint256 mark1) private view returns (ValuationLib.Position memory) {
         (int24 lower, int24 upper) = (positionLower, positionUpper);
         (, uint256 last0, uint256 last1) = MANAGER.getPositionInfo(POOL_ID, address(this), lower, upper, POSITION_SALT);
@@ -645,12 +661,16 @@ contract OathVault is ERC20, IUnlockCallback, ReentrancyGuardTransient, IOathVau
 
     /// @dev Moves the vault's position to `[tickLower, tickUpper)`, with an optional swap in between, in one
     ///      `unlock` of the PoolManager (`_onReposition`).
+    // Slither: the unlock callback returns nothing.
+    // slither-disable-next-line unused-return
     function _reposition(int24 tickLower, int24 tickUpper, IOathVault.SwapIntent calldata swap) private {
         // forge-lint: disable-next-line(unused-return)
         MANAGER.unlock(abi.encode(Action.REPOSITION, tickLower, tickUpper, swap)); // the callback returns nothing
     }
 
     /// @dev Removes the whole position in one `unlock` of the PoolManager (`_onUnwind`).
+    // Slither: the unlock callback returns nothing.
+    // slither-disable-next-line unused-return
     function _unwind() private {
         // forge-lint: disable-next-item(reentrancy-no-eth,unused-return)
         MANAGER.unlock(abi.encode(Action.UNWIND)); // the callback returns nothing
@@ -668,6 +688,8 @@ contract OathVault is ERC20, IUnlockCallback, ReentrancyGuardTransient, IOathVau
     ///      5. Store the new range and `L_new`.
     ///      The hook's intra-block guard runs on steps 1 and 4, so the whole reposition reverts if the price moved
     ///      more than `maxIntraBlockTicks` within the block, including through the curator's own swap.
+    // Slither: only the price is needed from `getSlot0`; `callerDelta` already includes the fees.
+    // slither-disable-next-line unused-return
     function _onReposition(int24 tickLower, int24 tickUpper, IOathVault.SwapIntent memory swap) private {
         // The PoolManager is trusted and every entry point holds the vault's reentrancy lock, so the position is
         // safely stored after the calls below.
@@ -727,6 +749,8 @@ contract OathVault is ERC20, IUnlockCallback, ReentrancyGuardTransient, IOathVau
 
     /// @dev Removes all of the vault's liquidity, if it has any. The returned credit is principal plus all
     ///      uncollected fees (`callerDelta` already includes them, so `feesAccrued` is unused).
+    // Slither: `callerDelta` already includes the fees, so `feesAccrued` is unused.
+    // slither-disable-next-line unused-return
     function _removePosition(PoolKey memory key) private returns (BalanceDelta delta) {
         uint128 liquidity = positionLiquidity;
         if (liquidity == 0) return delta;
