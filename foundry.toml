@@ -18,6 +18,12 @@ fs_permissions = [
 [fuzz]
 runs = 256
 
+[invariant]
+# Invariant suite (test/invariant): random sequences of every action. Use runs = 256, depth = 500 for a deep run.
+runs = 64
+depth = 200
+fail_on_revert = true
+
 [fmt]
 line_length = 120
 
