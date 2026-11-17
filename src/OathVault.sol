@@ -489,31 +489,37 @@ contract OathVault is ERC20, IUnlockCallback, ReentrancyGuardTransient, IOathVau
     // ---------------------------------------------------------------- views
 
     /// @notice Idle currency0: the vault's currency0 balance (its ETH balance if currency0 is native).
+    /// @inheritdoc IOathVault
     function idle0() public view returns (uint256) {
         return CURRENCY0.balanceOfSelf();
     }
 
     /// @notice Idle currency1: the vault's currency1 balance minus the bond.
+    /// @inheritdoc IOathVault
     function idle1() public view returns (uint256) {
         return CURRENCY1.balanceOfSelf() - bondBalance;
     }
 
     /// @notice The Uniswap v4 PoolManager.
+    /// @inheritdoc IOathVault
     function manager() external view returns (IPoolManager) {
         return MANAGER;
     }
 
     /// @notice The pool's Oath hook (the referee).
+    /// @inheritdoc IOathVault
     function hook() external view returns (IOathHook) {
         return HOOK;
     }
 
     /// @notice The factory that created this vault.
+    /// @inheritdoc IOathVault
     function factory() external view returns (address) {
         return FACTORY;
     }
 
     /// @notice The curator: posts the bond, starts epochs and rebalances.
+    /// @inheritdoc IOathVault
     function curator() external view returns (address) {
         return CURATOR;
     }
@@ -542,6 +548,7 @@ contract OathVault is ERC20, IUnlockCallback, ReentrancyGuardTransient, IOathVau
     }
 
     /// @notice Whether `settle` may be called: `state == ACTIVE && now ≥ epochEnd`.
+    /// @inheritdoc IOathVault
     function isSettleable() external view returns (bool) {
         // forge-lint: disable-next-line(block-timestamp)
         return state == IOathVault.State.ACTIVE && block.timestamp >= epochEnd;
@@ -549,11 +556,13 @@ contract OathVault is ERC20, IUnlockCallback, ReentrancyGuardTransient, IOathVau
 
     /// @notice The result of settled epoch `i`, `0 ≤ i < epochCount()`.
     /// @param i Epoch index.
+    /// @inheritdoc IOathVault
     function getResult(uint256 i) external view returns (IOathVault.EpochResult memory) {
         return results[i];
     }
 
     /// @notice Number of settled epochs; also the index of the current epoch while ACTIVE.
+    /// @inheritdoc IOathVault
     function epochCount() external view returns (uint256) {
         return results.length;
     }
@@ -567,6 +576,7 @@ contract OathVault is ERC20, IUnlockCallback, ReentrancyGuardTransient, IOathVau
     }
 
     /// @notice The vault's pool key.
+    /// @inheritdoc IOathVault
     function poolKey() public view returns (PoolKey memory) {
         return PoolKey({
             currency0: CURRENCY0,
@@ -578,11 +588,13 @@ contract OathVault is ERC20, IUnlockCallback, ReentrancyGuardTransient, IOathVau
     }
 
     /// @notice The vault's pool id.
+    /// @inheritdoc IOathVault
     function poolId() external view returns (PoolId) {
         return POOL_ID;
     }
 
     /// @notice The vault's fixed parameters (MATH.md §12).
+    /// @inheritdoc IOathVault
     function params() external view returns (IOathVault.VaultParams memory) {
         return IOathVault.VaultParams({
             epochDuration: EPOCH_DURATION,

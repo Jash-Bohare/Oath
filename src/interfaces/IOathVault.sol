@@ -187,41 +187,65 @@ interface IOathVault {
     error AlreadyInitialized();
 
     /// @notice The Uniswap v4 PoolManager.
+    /// @return The PoolManager.
     function manager() external view returns (IPoolManager);
     /// @notice The pool's Oath hook (the referee).
+    /// @return The hook.
     function hook() external view returns (IOathHook);
     /// @notice The factory that created this vault.
+    /// @return The factory.
     function factory() external view returns (address);
     /// @notice The curator: posts the bond, starts epochs and rebalances.
+    /// @return The curator.
     function curator() external view returns (address);
     /// @notice The vault's pool key.
+    /// @return The pool key.
     function poolKey() external view returns (PoolKey memory);
     /// @notice The vault's pool id.
+    /// @return The pool id.
     function poolId() external view returns (PoolId);
     /// @notice The vault's fixed parameters.
+    /// @return The parameters (see `VaultParams`).
     function params() external view returns (VaultParams memory);
 
     /// @notice Current lifecycle state.
+    /// @return OPEN or ACTIVE.
     function state() external view returns (State);
     /// @notice Currency1 held as curator bond (excluded from NAV).
+    /// @return The bond in raw currency1 units.
     function bondBalance() external view returns (uint256);
     /// @notice Open-window start `T0`.
+    /// @return `T0` (unix seconds).
     function openSince() external view returns (uint32);
     /// @notice Hook tick cumulative at `T0`.
+    /// @return The hook's tick cumulative at `T0`.
     function cumAtOpen() external view returns (int256);
     /// @notice Current or last epoch start `S`.
+    /// @return `S` (unix seconds).
     function epochStart() external view returns (uint32);
     /// @notice Current or last epoch end `E`.
+    /// @return `E` (unix seconds).
     function epochEnd() external view returns (uint32);
     /// @notice Time of the last `startEpoch` or `rebalance`.
+    /// @return The time of the last reposition (unix seconds).
     function lastReposition() external view returns (uint32);
     /// @notice Vault position liquidity `L_v`.
+    /// @return `L_v` (zero in the open window).
     function positionLiquidity() external view returns (uint128);
     /// @notice Vault position lower tick.
+    /// @return The lower tick.
     function positionLower() external view returns (int24);
     /// @notice Vault position upper tick.
+    /// @return The upper tick.
     function positionUpper() external view returns (int24);
     /// @notice The current epoch's benchmark (see `Benchmark`).
+    /// @return L Benchmark liquidity `L_b`.
+    /// @return r0 Leftover currency0 held outside the pool.
+    /// @return r1 Leftover currency1 held outside the pool.
+    /// @return G0 Global fee growth of currency0 at `S` (Q128).
+    /// @return G1 Global fee growth of currency1 at `S` (Q128).
+    /// @return navStart Vault NAV at the start TWAP price `V_S`.
+    /// @return startTick Start TWAP tick.
     function benchmark()
         external
         view
@@ -229,10 +253,13 @@ interface IOathVault {
         returns (uint128 L, uint256 r0, uint256 r1, uint256 G0, uint256 G1, uint256 navStart, int24 startTick);
 
     /// @notice Idle currency0: the vault's currency0 balance (native ETH balance if currency0 is native).
+    /// @return Idle currency0 (raw units).
     function idle0() external view returns (uint256);
     /// @notice Idle currency1: the vault's currency1 balance minus `bondBalance`.
+    /// @return Idle currency1 (raw units).
     function idle1() external view returns (uint256);
     /// @notice Whether `settle` may be called: `state == ACTIVE && now ≥ epochEnd`.
+    /// @return True if `settle` would pass its state and time checks.
     function isSettleable() external view returns (bool);
 
     /// @notice Deposits in kind during the open window (MATH.md §11). Price-free: the
@@ -302,10 +329,12 @@ interface IOathVault {
     function previewLive() external view returns (uint256 navNow, uint256 benchNow, int256 diff);
 
     /// @notice Number of settled epochs.
+    /// @return The number of settled epochs.
     function epochCount() external view returns (uint256);
 
     /// @notice The result of settled epoch `i`.
     /// @param i Epoch index, `0 ≤ i < epochCount()`.
+    /// @return The stored `EpochResult`.
     function getResult(uint256 i) external view returns (EpochResult memory);
 
     /// @notice The vault's current position.

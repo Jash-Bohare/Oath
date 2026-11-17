@@ -41,9 +41,11 @@ interface IOathFactory {
     error BadCap();
 
     /// @notice The Uniswap v4 PoolManager.
+    /// @return The PoolManager.
     function manager() external view returns (IPoolManager);
 
     /// @notice The Oath hook every pool created here uses.
+    /// @return The hook.
     function hook() external view returns (IOathHook);
 
     /// @notice Creates the pool `(currency0, currency1, fee, tickSpacing, hook)` at `sqrtPriceX96` with a new

@@ -101,15 +101,26 @@ interface IOathHook {
     error ZeroVault();
 
     /// @notice The only address allowed to register vaults and initialize pools with this hook.
+    /// @return The factory.
     function factory() external view returns (address);
 
     /// @notice The TWAP accumulator state of a pool (see `Oracle`).
+    /// @param id The pool id.
+    /// @return lastTimestamp Last time `tickCumulative` was advanced.
+    /// @return lastSwapBlock Block number of the last `beforeSwap`.
+    /// @return blockStartTick Tick before the first swap of `lastSwapBlock`.
+    /// @return tickCumulative Σ tick·dt up to `lastTimestamp`.
     function oracles(PoolId id)
         external
         view
         returns (uint32 lastTimestamp, uint64 lastSwapBlock, int24 blockStartTick, int256 tickCumulative);
 
     /// @notice The registration and vault range of a pool (see `PoolConfig`).
+    /// @param id The pool id.
+    /// @return vault The pool's registered vault.
+    /// @return maxIntraBlockTicks Guard threshold for vault liquidity changes.
+    /// @return vaultLower Lower tick of the last range the vault added liquidity to.
+    /// @return vaultUpper Upper tick of the last range the vault added liquidity to.
     function configs(PoolId id)
         external
         view
@@ -151,5 +162,6 @@ interface IOathHook {
     /// @notice The pool's current epoch record (checkpoints and snapshot). The vault requires
     ///         `snapTaken && doneA && doneB` before using it at settlement.
     /// @param key The pool key.
+    /// @return The `Epoch` record.
     function epochData(PoolKey calldata key) external view returns (Epoch memory);
 }
