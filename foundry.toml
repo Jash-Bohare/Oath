@@ -15,6 +15,11 @@ fs_permissions = [
     { access = "read-write", path = "./demo" },
 ]
 
+[profile.demo]
+# Demo backtest (script/demo/Replay.s.sol): a week of replayed swaps needs more than the default 2^30 gas per
+# script run. Run with FOUNDRY_PROFILE=demo; every other setting is the default profile's.
+gas_limit = "max"
+
 [fuzz]
 runs = 256
 
