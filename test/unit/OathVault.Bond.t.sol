@@ -90,4 +90,98 @@ contract OathVaultBondTest is OathVaultTestBase {
         vm.expectRevert(IOathVault.NotCurator.selector);
         vault.withdrawBond(1);
     }
+
+    // ---------------------------------------------------------------- the bond is never depositors' money
+
+    /// @dev A bond posted before any deposit plays no part in pricing: the first deposit is `sqrt(a0·a1)` and the
+    ///      next one is priced against holdings without the bond.
+    function test_bond_excludedFromDepositPricing() public {
+        vm.prank(curator);
+        vault.postBond(5e18);
+        (uint256 first,,) = _deposit(alice, 1e18, 4e18);
+        assertEq(first, 2e18 - 1_000, "first deposit ignores the bond");
+
+        (uint256 shares,, uint256 used1) = _deposit(bob, 1e18, 4e18);
+        assertEq(shares, 2e18, "priced on holdings 1e18 / 4e18, not on 9e18 currency1");
+        assertEq(used1, 4e18);
+    }
+
+    /// @dev Redeeming every share pays out depositors' holdings only; the bond stays whole.
+    function test_bond_untouchedByWithdrawals() public {
+        _deposit(alice, 1e18, 1e18);
+        vm.prank(curator);
+        vault.postBond(3_000e6);
+        uint256 held = vault.balanceOf(alice);
+
+        vm.prank(alice);
+        (, uint256 out1) = vault.withdraw(held, 0, 0, alice);
+        assertEq(out1, 1e18 - 1_000, "only depositors' currency1");
+        assertEq(vault.bondBalance(), 3_000e6);
+        assertEq(currency1.balanceOf(address(vault)), 3_000e6 + 1_000, "bond + dead share's part");
+    }
+
+    /// @dev The curator can also be a depositor; deposits never add to the bond and bond withdrawals never touch
+    ///      the curator's shares.
+    function test_bond_separateFromCuratorShares() public {
+        _give(curator, 1e30, 0);
+        (uint256 shares,,) = _deposit(curator, 1e18, 1e18);
+        vm.startPrank(curator);
+        vault.postBond(2e18);
+        vault.withdrawBond(2e18);
+        vm.stopPrank();
+        assertEq(vault.bondBalance(), 0, "deposit did not become bond");
+        assertEq(vault.balanceOf(curator), shares, "shares untouched");
+        assertEq(vault.idle1(), 1e18);
+    }
+
+    /// @dev currency1 sent straight to the vault belongs to depositors, not to the bond.
+    function test_bond_donationIsNotBond() public {
+        vm.prank(curator);
+        vault.postBond(1_000e6);
+        vm.prank(bob);
+        currency1.transfer(address(vault), 7e6);
+        assertEq(vault.bondBalance(), 1_000e6);
+        assertEq(vault.idle1(), 7e6);
+
+        vm.prank(curator);
+        vm.expectRevert(IOathVault.InsufficientBond.selector);
+        vault.withdrawBond(1_000e6 + 1);
+    }
+
+    /// @dev Over random deposits, withdrawals, bond posts and bond withdrawals: the vault always holds at least
+    ///      the bond (I1), `idle1` is exactly the rest, and the curator never gets back more than was posted.
+    function testFuzz_bond_alwaysCovered(uint256 seed) public {
+        uint256 posted;
+        uint256 returned;
+        for (uint256 i; i < 24; i++) {
+            uint256 r = uint256(keccak256(abi.encode(seed, i)));
+            uint256 action = r % 4;
+            if (action == 0) {
+                vm.prank(r % 8 == 0 ? bob : alice);
+                try vault.deposit(1 + (r >> 8) % 1e24, 1 + (r >> 96) % 1e24, 0, alice) {} catch {}
+            } else if (action == 1) {
+                uint256 held = vault.balanceOf(alice);
+                if (held != 0) {
+                    vm.prank(alice);
+                    vault.withdraw(1 + (r >> 8) % held, 0, 0, alice);
+                }
+            } else if (action == 2) {
+                uint256 amount = (r >> 8) % 1e24;
+                vm.prank(curator);
+                vault.postBond(amount);
+                posted += amount;
+            } else {
+                uint256 bond = vault.bondBalance();
+                uint256 amount = bond == 0 ? 0 : (r >> 8) % (bond + 1);
+                vm.prank(curator);
+                vault.withdrawBond(amount);
+                returned += amount;
+            }
+
+            uint256 balance1 = currency1.balanceOf(address(vault));
+            assertGe(balance1, vault.bondBalance(), "I1: balance1 >= bond");
+            assertEq(vault.idle1(), balance1 - vault.bondBalance(), "idle1 = balance1 - bond");
+            assertEq(vault.bondBalance(), posted - returned, "bond = posted - returned");
+        }
+    }
 }
