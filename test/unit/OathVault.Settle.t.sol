@@ -115,6 +115,80 @@ contract OathVaultSettleTest is OathVaultTestBase {
         assertEq(vault.epochCount(), 1, "one settled epoch");
     }
 
+    // ---------------------------------------------------------------- live preview
+
+    /// @dev While OPEN nothing is measured: both sides are the idle NAV at spot, before the first epoch and again
+    ///      after a settlement.
+    function test_preview_openIsIdleNav() public {
+        _assertOpenPreview();
+        _begin(RANGE_LOWER, RANGE_UPPER);
+        _swapAroundStart(2);
+        _toEnd();
+        _settleAs(keeper);
+        _assertOpenPreview();
+    }
+
+    /// @dev Right after the start, at spot = start TWAP and no swaps yet, the vault and the benchmark are marked
+    ///      equal up to rounding: the benchmark is below `navStart` by at most `6u` (MATH.md §6.1) and the vault's
+    ///      position costs at most one raw unit of each currency to round up (`value(1, 1) + 1`).
+    function test_preview_startsEqual() public {
+        _begin(RANGE_LOWER, RANGE_UPPER);
+        (uint256 navNow, uint256 benchNow, int256 diff) = vault.previewLive();
+        uint160 sqrtP = TickMath.getSqrtPriceAtTick(START_TICK);
+        uint256 u = ValuationLib.value(1, 0, sqrtP) + 1;
+        assertLe(navNow, NAV_START);
+        assertLe(benchNow, NAV_START);
+        assertLe(NAV_START - navNow, ValuationLib.value(1, 1, sqrtP) + 1, "vault at start");
+        assertLe(NAV_START - benchNow, 6 * u, "benchmark at start");
+        assertEq(diff, int256(navNow) - int256(benchNow));
+    }
+
+    /// @dev During the epoch the preview is the vault's NAV with the pool's live fee growth inside its range and
+    ///      the benchmark with the live global fee growth, both at spot.
+    function test_preview_activeIsLiveMark() public {
+        _begin(RANGE_LOWER, RANGE_UPPER);
+        _swapAroundStart(3);
+        _nextBlock(1 hours);
+        _moveToTick(START_TICK - 120); // spot away from the start, inside the range
+
+        (uint160 sqrtP,,,) = manager.getSlot0(key.toId());
+        (uint256 in0, uint256 in1) = manager.getFeeGrowthInside(key.toId(), RANGE_LOWER, RANGE_UPPER);
+        (,, uint128 liquidity) = vault.positionInfo();
+        (, uint256 last0, uint256 last1) =
+            manager.getPositionInfo(key.toId(), address(vault), RANGE_LOWER, RANGE_UPPER, bytes32(0));
+        (uint256 navExpected, uint256 fees0,) = ValuationLib.nav(
+            vault.idle0(),
+            vault.idle1(),
+            ValuationLib.Position(liquidity, RANGE_LOWER, RANGE_UPPER, last0, last1, in0, in1),
+            sqrtP
+        );
+        IOathVault.Benchmark memory b;
+        (b.L, b.r0, b.r1, b.G0, b.G1, b.navStart, b.startTick) = vault.benchmark();
+        (uint256 g0, uint256 g1) = manager.getFeeGrowthGlobals(key.toId());
+        (uint256 benchExpected,,) = BenchmarkLib.valueAt(b, g0, g1, sqrtP, TICK_SPACING);
+
+        (uint256 navNow, uint256 benchNow, int256 diff) = vault.previewLive();
+        assertGt(fees0, 0, "live fees counted");
+        assertEq(navNow, navExpected, "vault live mark");
+        assertEq(benchNow, benchExpected, "benchmark live mark");
+        assertEq(diff, int256(navNow) - int256(benchNow));
+    }
+
+    /// @dev At `E`, with spot equal to the end TWAP and no swap since, the live mark and the settlement agree to
+    ///      the wei: live fee growth at `E` is exactly the hook's snapshot.
+    function test_preview_atEndEqualsSettlement() public {
+        _begin(RANGE_LOWER, RANGE_UPPER);
+        _swapAroundStart(3);
+        _toEnd();
+        (uint256 navNow, uint256 benchNow, int256 diff) = vault.previewLive();
+        _settleAs(keeper);
+        IOathVault.EpochResult memory r = vault.getResult(0);
+        assertEq(r.endTick, START_TICK, "end TWAP = spot");
+        assertEq(navNow, r.navEnd, "NAV");
+        assertEq(benchNow, r.benchEnd, "benchmark");
+        assertEq(diff, r.diff, "difference");
+    }
+
     // ---------------------------------------------------------------- preconditions
 
     /// @dev Not before `E`: one second earlier reverts; `isSettleable` flips exactly at `E`.
@@ -138,6 +212,18 @@ contract OathVaultSettleTest is OathVaultTestBase {
     }
 
     // ---------------------------------------------------------------- helpers
+
+    /// @dev OPEN preview: `(value(idle0, idle1, spot), same, 0)`.
+    function _assertOpenPreview() internal view {
+        assertEq(uint8(vault.state()), uint8(IOathVault.State.OPEN));
+        (uint160 sqrtP,,,) = manager.getSlot0(key.toId());
+        uint256 idleNav = ValuationLib.value(vault.idle0(), vault.idle1(), sqrtP);
+        assertGt(idleNav, 0);
+        (uint256 navNow, uint256 benchNow, int256 diff) = vault.previewLive();
+        assertEq(navNow, idleNav, "idle NAV at spot");
+        assertEq(benchNow, idleNav, "benchmark = NAV while OPEN");
+        assertEq(diff, 0);
+    }
 
     /// @dev The curator starts the epoch on `[lower, upper)` without a swap.
     function _begin(int24 lower, int24 upper) internal {

@@ -7,6 +7,7 @@ import {IERC20Metadata} from "@openzeppelin/contracts/token/ERC20/extensions/IER
 import {SafeERC20} from "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
 import {Math} from "@openzeppelin/contracts/utils/math/Math.sol";
 import {ReentrancyGuardTransient} from "@openzeppelin/contracts/utils/ReentrancyGuardTransient.sol";
+import {SafeCast} from "@openzeppelin/contracts/utils/math/SafeCast.sol";
 import {IPoolManager} from "@uniswap/v4-core/src/interfaces/IPoolManager.sol";
 import {IHooks} from "@uniswap/v4-core/src/interfaces/IHooks.sol";
 import {IUnlockCallback} from "@uniswap/v4-core/src/interfaces/callback/IUnlockCallback.sol";
@@ -32,7 +33,7 @@ import {ValuationLib} from "./libraries/ValuationLib.sol";
 ///         counterfactual (MATH.md §6, §9). Created only by `OathFactory`, which also creates its pool.
 /// @dev Pool key and parameters are fixed at creation and held as immutables. Values are in raw currency1 units
 ///      (MATH.md §1).
-contract OathVault is ERC20, IUnlockCallback, ReentrancyGuardTransient {
+contract OathVault is ERC20, IUnlockCallback, ReentrancyGuardTransient, IOathVault {
     using SafeERC20 for IERC20;
     using StateLibrary for IPoolManager;
     using CurrencySettler for Currency;
@@ -411,7 +412,8 @@ contract OathVault is ERC20, IUnlockCallback, ReentrancyGuardTransient {
         uint160 sqrtPriceEnd = TickMath.getSqrtPriceAtTick(r.endTick);
 
         // 3. Vault NAV at E.
-        (r.navEnd, r.vaultFees0, r.vaultFees1) = ValuationLib.nav(idle0(), idle1(), _positionAtEnd(e), sqrtPriceEnd);
+        (r.navEnd, r.vaultFees0, r.vaultFees1) =
+            ValuationLib.nav(idle0(), idle1(), _positionMarkedAt(e.fgIn0, e.fgIn1), sqrtPriceEnd);
 
         // 4. Benchmark value at E.
         IOathVault.Benchmark memory b = benchmark;
@@ -506,6 +508,27 @@ contract OathVault is ERC20, IUnlockCallback, ReentrancyGuardTransient {
         return CURATOR;
     }
 
+    /// @notice Live mark of the vault and the benchmark at the current spot price, with live fee growth. For
+    ///         display only ("live mark (spot)"); settlement marks both at the end-of-epoch TWAP instead.
+    ///         - ACTIVE (including after `E` until settled): `navNow` is MATH.md §7 with the pool's live fee growth
+    ///           inside the vault's range; `benchNow` is MATH.md §6.2 with the live global fee growth.
+    ///         - OPEN (no epoch running): `navNow` is the idle NAV at spot, `benchNow = navNow`, `diff = 0`.
+    /// @return navNow Vault NAV at spot.
+    /// @return benchNow Benchmark value at spot.
+    /// @return diff `navNow − benchNow`.
+    function previewLive() external view returns (uint256 navNow, uint256 benchNow, int256 diff) {
+        (uint160 sqrtPriceX96,,,) = MANAGER.getSlot0(POOL_ID);
+        if (state == IOathVault.State.OPEN) {
+            navNow = ValuationLib.value(idle0(), idle1(), sqrtPriceX96);
+            return (navNow, navNow, 0);
+        }
+        (uint256 in0, uint256 in1) = MANAGER.getFeeGrowthInside(POOL_ID, positionLower, positionUpper);
+        (navNow,,) = ValuationLib.nav(idle0(), idle1(), _positionMarkedAt(in0, in1), sqrtPriceX96);
+        (uint256 g0, uint256 g1) = MANAGER.getFeeGrowthGlobals(POOL_ID);
+        (benchNow,,) = BenchmarkLib.valueAt(benchmark, g0, g1, sqrtPriceX96, TICK_SPACING);
+        diff = SafeCast.toInt256(navNow) - SafeCast.toInt256(benchNow);
+    }
+
     /// @notice Whether `settle` may be called: `state == ACTIVE && now ≥ epochEnd`.
     function isSettleable() external view returns (bool) {
         // forge-lint: disable-next-line(block-timestamp)
@@ -581,10 +604,11 @@ contract OathVault is ERC20, IUnlockCallback, ReentrancyGuardTransient {
         used1 = FullMath.mulDivRoundingUp(h1, shares, supply);
     }
 
-    /// @dev The vault's position marked at `E` for MATH.md §7: fee growth inside when its fees were last
-    ///      collected (`getPositionInfo`), and the hook's snapshot of fee growth inside at `E` as the mark. With
-    ///      `positionLiquidity == 0` the marks are irrelevant: fees and principal are 0.
-    function _positionAtEnd(IOathHook.Epoch memory e) private view returns (ValuationLib.Position memory) {
+    /// @dev The vault's position for MATH.md §7, marked at fee growth inside `(mark0, mark1)`: the hook's
+    ///      snapshot at `E` for settlement, the live value for `previewLive`. The last marks are the fee growth
+    ///      inside when its fees were last collected (`getPositionInfo`). With `positionLiquidity == 0` the marks
+    ///      are irrelevant: fees and principal are 0.
+    function _positionMarkedAt(uint256 mark0, uint256 mark1) private view returns (ValuationLib.Position memory) {
         (int24 lower, int24 upper) = (positionLower, positionUpper);
         (, uint256 last0, uint256 last1) = MANAGER.getPositionInfo(POOL_ID, address(this), lower, upper, POSITION_SALT);
         return ValuationLib.Position({
@@ -593,8 +617,8 @@ contract OathVault is ERC20, IUnlockCallback, ReentrancyGuardTransient {
             tickUpper: upper,
             feeGrowthInside0Last: last0,
             feeGrowthInside1Last: last1,
-            feeGrowthInside0Mark: e.fgIn0,
-            feeGrowthInside1Mark: e.fgIn1
+            feeGrowthInside0Mark: mark0,
+            feeGrowthInside1Mark: mark1
         });
     }
 
