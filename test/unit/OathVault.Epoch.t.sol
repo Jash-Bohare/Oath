@@ -613,6 +613,51 @@ contract OathVaultStartEpochTest is OathVaultTestBase {
         assertEq(_poolPositionLiquidity(lower, upper), liquidity, "pool position = L_v");
     }
 
+    // ---------------------------------------------------------------- while ACTIVE
+
+    /// @dev Deposits happen only in the open window.
+    function test_active_depositReverts() public {
+        _startWorkedExample();
+        _give(bob, 1e18, 1e9);
+        vm.prank(bob);
+        vm.expectRevert(IOathVault.NotOpen.selector);
+        vault.deposit(1e18, 1e9, 0, bob);
+    }
+
+    /// @dev Withdrawals happen only in the open window.
+    function test_active_withdrawReverts() public {
+        _startWorkedExample();
+        uint256 shares = vault.balanceOf(alice);
+        assertGt(shares, 0);
+        vm.prank(alice);
+        vm.expectRevert(IOathVault.NotOpen.selector);
+        vault.withdraw(shares, 0, 0, alice);
+    }
+
+    /// @dev During an epoch the bond backs the curator's result and cannot be withdrawn.
+    function test_active_withdrawBondReverts() public {
+        _startWorkedExample();
+        vm.prank(curator);
+        vm.expectRevert(IOathVault.NotOpen.selector);
+        vault.withdrawBond(1);
+    }
+
+    /// @dev The open window cannot be refreshed during an epoch, however long ago it opened.
+    function test_active_refreshOpenWindowReverts() public {
+        _startWorkedExample();
+        vm.warp(createdAt + 6 hours + 1);
+        vm.expectRevert(IOathVault.NotOpen.selector);
+        vault.refreshOpenWindow();
+    }
+
+    /// @dev The curator can add to the bond at any time, including during an epoch.
+    function test_active_postBondAllowed() public {
+        _startWorkedExample();
+        _postBond(500e6);
+        assertEq(vault.bondBalance(), BOND + 500e6);
+        assertEq(c1.balanceOf(address(vault)), vault.idle1() + BOND + 500e6);
+    }
+
     /// @dev Native ETH as currency0: the curator's ETH swap and the liquidity add are both paid in ETH.
     function test_start_nativeEth() public {
         _createVault(CurrencyLibrary.ADDRESS_ZERO);
