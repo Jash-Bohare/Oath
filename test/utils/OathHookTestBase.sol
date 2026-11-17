@@ -100,23 +100,4 @@ abstract contract OathHookTestBase is OathTestBase {
     function _tick() internal view returns (int24 tick) {
         (, tick,,) = manager.getSlot0(id);
     }
-
-    /// @dev Live block values. Under via_ir the optimizer may treat `block.timestamp` and `block.number` as
-    ///      constant within the test's transaction, so after `vm.warp`/`vm.roll` read them through the cheatcodes.
-    function _time() internal view returns (uint256) {
-        return vm.getBlockTimestamp();
-    }
-
-    function _block() internal view returns (uint256) {
-        return vm.getBlockNumber();
-    }
-
-    function _wait(uint256 dt) internal {
-        vm.warp(_time() + dt);
-    }
-
-    function _nextBlock(uint256 dt) internal {
-        vm.roll(_block() + 1);
-        vm.warp(_time() + dt);
-    }
 }
