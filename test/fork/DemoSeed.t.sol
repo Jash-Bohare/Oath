@@ -13,7 +13,7 @@ import {OathVault} from "../../src/OathVault.sol";
 import {Seed} from "../../script/demo/Seed.s.sol";
 
 /// @notice The demo seed script on mainnet at B0: the Oath pool carries the real pool's price and liquidity
-///         curve, and the vault holds exactly $30,000 split 50/50 by value plus the $3,000 bond, in its first
+///         curve, and the vault holds exactly $15,000 split 50/50 by value plus the $1,500 bond, in its first
 ///         open window.
 /// @dev Not isolated: the script runs as one call, which isolation would cap at the block gas limit.
 /// forge-config: default.isolate = false
@@ -57,11 +57,11 @@ contract DemoSeedForkTest is Test {
         (uint256 d0, uint256 d1) = (seed.deposit0(), seed.deposit1());
         assertEq(vault.idle0(), d0, "ETH deposited");
         assertEq(vault.idle1(), d1, "USDC deposited");
-        assertEq(ValuationLib.value(d0, d1, seed.sqrtStart()), 30_000e6, "$30,000 at the start price");
+        assertEq(ValuationLib.value(d0, d1, seed.sqrtStart()), 15_000e6, "$15,000 at the start price");
         uint256 ethValue = ValuationLib.value(d0, 0, seed.sqrtStart());
-        assertApproxEqAbs(ethValue, 15_000e6, 1, "50/50 by value");
-        assertEq(vault.bondBalance(), 3_000e6, "bond");
-        assertEq(IERC20Minimal(USDC).balanceOf(address(vault)), d1 + 3_000e6);
+        assertApproxEqAbs(ethValue, 7_500e6, 1, "50/50 by value");
+        assertEq(vault.bondBalance(), 1_500e6, "bond 10%");
+        assertEq(IERC20Minimal(USDC).balanceOf(address(vault)), d1 + 1_500e6);
         assertEq(uint8(vault.state()), uint8(IOathVault.State.OPEN));
         assertEq(vault.openSince(), seed.createdAt(), "open window from creation");
         assertEq(vault.params().epochDuration, 1 days, "demo epochs");

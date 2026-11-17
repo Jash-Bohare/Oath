@@ -26,8 +26,10 @@ import {OathVault} from "../../src/OathVault.sol";
 /// @notice The demo's starting state, on an Ethereum-mainnet fork at the block of a recorded liquidity layout
 ///         (`demo/pool_tvl.py`): Oath deployed (hook at a flagged address, factory), a native-ETH/USDC Oath vault
 ///         and pool created at the real ETH/USDC 0.05% pool's price with the demo parameters (1-day epochs), the
-///         real pool's liquidity curve cloned into the Oath pool, a $30,000 deposit split 50/50 by value, and a
-///         $3,000 curator bond.
+///         real pool's liquidity curve cloned into the Oath pool, a $15,000 deposit split 50/50 by value, and a
+///         $1,500 curator bond (10%). The vault is half the MATH.md §9.1 worked example so that its benchmark stays
+///         under the 25 bps size cap (MATH.md §10) through the Nov 8–15 2026 fall, when the price moved to where the
+///         pool's active liquidity is thinner (at most ≈ 19 bps, against ≈ 37 bps for $30,000).
 /// @dev Simulation only (cheatcodes: `deal`, `deployCodeTo`, `prank`); nothing is broadcast. Forge scripts may not
 ///      hold funds or be called back, so the cloned liquidity comes from a `seeder` address funded with `deal`.
 abstract contract DemoSeed is Script, StdCheats {
@@ -50,9 +52,9 @@ abstract contract DemoSeed is Script, StdCheats {
                 | Hooks.BEFORE_SWAP_FLAG
                 | Hooks.BEFORE_DONATE_FLAG)
     );
-    /// @dev The depositors' $30,000 and the curator's $3,000 bond (USDC units).
-    uint256 internal constant NAV_START = 30_000e6;
-    uint256 internal constant BOND = 3_000e6;
+    /// @dev The depositors' $15,000 and the curator's $1,500 bond (USDC units).
+    uint256 internal constant NAV_START = 15_000e6;
+    uint256 internal constant BOND = 1_500e6;
     /// @dev The B0 layout (Nov 8 2026, block 26,367,600), relative to the project root.
     string internal constant DEFAULT_LAYOUT = "demo/layout_B0.json";
 
@@ -83,7 +85,7 @@ abstract contract DemoSeed is Script, StdCheats {
     error CloneMismatch(uint128 cloned, uint128 real);
     /// @notice The layout's liquidityNet does not sum to zero over all initialized ticks.
     error LayoutNotClosed(int256 remaining);
-    /// @notice The seeded vault's value at the start price is not exactly $30,000.
+    /// @notice The seeded vault's value at the start price is not exactly `NAV_START`.
     error SeedValueMismatch(uint256 value);
 
     /// @dev Forks mainnet at the layout's block and builds the starting state (see the contract notice).
@@ -177,8 +179,8 @@ abstract contract DemoSeed is Script, StdCheats {
         require(cloned == real && cloned == vm.parseJsonUint(layout, ".activeLiquidity"), CloneMismatch(cloned, real));
     }
 
-    /// @dev The depositor deposits the 50/50-by-value split of $30,000 at the start price (the ETH half from
-    ///      `BenchmarkLib.split`, and the USDC that makes exactly $30,000); the curator posts the $3,000 bond.
+    /// @dev The depositor deposits the 50/50-by-value split of $15,000 at the start price (the ETH half from
+    ///      `BenchmarkLib.split`, and the USDC that makes exactly $15,000); the curator posts the $1,500 bond.
     function _fund() private {
         (deposit0,) = BenchmarkLib.split(NAV_START, sqrtStart);
         deposit1 = NAV_START - ValuationLib.value(deposit0, 0, sqrtStart);
