@@ -23,6 +23,7 @@ import {CurrencySettler} from "@openzeppelin/uniswap-hooks/utils/CurrencySettler
 import {IOathHook} from "./interfaces/IOathHook.sol";
 import {IOathVault} from "./interfaces/IOathVault.sol";
 import {BenchmarkLib} from "./libraries/BenchmarkLib.sol";
+import {SettlementLib} from "./libraries/SettlementLib.sol";
 import {ValuationLib} from "./libraries/ValuationLib.sol";
 
 /// @title OathVault
@@ -96,8 +97,6 @@ contract OathVault is ERC20, IUnlockCallback, ReentrancyGuardTransient {
     /// @notice The current epoch's benchmark (MATH.md §6.1).
     IOathVault.Benchmark public benchmark;
     /// @notice Results of the settled epochs, in order.
-    /// @dev Empty until settlement exists to append to it.
-    // forge-lint: disable-next-line(uninitialized-state)
     IOathVault.EpochResult[] public results;
 
     /// @dev Called by `OathFactory`, which becomes `factory()`. The factory validates `params`, rejects a zero
@@ -364,6 +363,77 @@ contract OathVault is ERC20, IUnlockCallback, ReentrancyGuardTransient {
         emit IOathVault.Rebalanced(tickLower, tickUpper, positionLiquidity);
     }
 
+    // ---------------------------------------------------------------- settlement
+
+    /// @notice Settles the epoch against its benchmark (MATH.md §5–§9). Anyone, once `now ≥ E`. Steps, in order:
+    ///         1. `hook.poke`: records any due checkpoint and the boundary snapshot at `E` (MATH.md §8).
+    ///         2. End price: `endTick = floorDiv(cumB − cumA, W)`, the TWAP over `[E − W, E]`;
+    ///            `sqrtP_E = getSqrtPriceAtTick(endTick)`.
+    ///         3. Vault NAV at `E` (MATH.md §7): idle balances (unchanged since `E`: the vault is frozen) plus the
+    ///            position's principal at `sqrtP_E` and its fees between its last fee-growth-inside and the
+    ///            snapshot's fee growth inside at `E`.
+    ///         4. Benchmark value at `E` (MATH.md §6.2), with the snapshot's global fee growth at `E`.
+    ///         5. Verdict: `SettlementLib.settle` (MATH.md §9).
+    ///         6. Apply: the payout moves from the bond to the depositors (the tokens stay in the vault and
+    ///            become idle); the fee shares are minted to the curator.
+    ///         9. Store the `EpochResult` and emit `Settled`.
+    /// @dev Both sides are marked at the same TWAP, never at spot, so moving the price at `E` cannot favour
+    ///      either (MATH.md §9.3). Reverts `NotActive()`, `EpochNotEnded()`, or `IOathHook.EpochNotReady()` if the
+    ///      hook has not recorded both checkpoints and the snapshot (impossible after the poke; checked anyway).
+    function settle() external nonReentrant {
+        if (state != IOathVault.State.ACTIVE) revert IOathVault.NotActive();
+        // Epochs are days long; validator timestamp skew of seconds is irrelevant here.
+        // forge-lint: disable-next-line(block-timestamp)
+        if (block.timestamp < epochEnd) revert IOathVault.EpochNotEnded();
+        PoolKey memory key = poolKey();
+
+        // The steps run in the order above. The hook and the PoolManager are trusted and this function holds the
+        // reentrancy lock, so events after their calls cannot be reordered by reentry.
+
+        // 1. Checkpoints and boundary snapshot.
+        HOOK.poke(key);
+        IOathHook.Epoch memory e = HOOK.epochData(key);
+        if (!(e.snapTaken && e.doneA && e.doneB)) revert IOathHook.EpochNotReady();
+
+        // 2. End price: the TWAP over the last W seconds of the epoch.
+        IOathVault.EpochResult memory r;
+        r.endTick = _twapTick(e.cumB - e.cumA, TWAP_WINDOW);
+        uint160 sqrtPriceEnd = TickMath.getSqrtPriceAtTick(r.endTick);
+
+        // 3. Vault NAV at E.
+        (r.navEnd, r.vaultFees0, r.vaultFees1) = ValuationLib.nav(idle0(), idle1(), _positionAtEnd(e), sqrtPriceEnd);
+
+        // 4. Benchmark value at E.
+        IOathVault.Benchmark memory b = benchmark;
+        (r.benchEnd, r.benchFees0, r.benchFees1) = BenchmarkLib.valueAt(b, e.G0, e.G1, sqrtPriceEnd, TICK_SPACING);
+
+        // 5. Verdict.
+        (r.payout, r.fee, r.feeShares, r.diff, r.band) =
+            SettlementLib.settle(r.navEnd, r.benchEnd, bondBalance, totalSupply(), BAND_BPS, PERF_FEE_BPS);
+
+        // 6. Apply.
+        bondBalance -= r.payout;
+        if (r.feeShares > 0) _mint(CURATOR, r.feeShares);
+        if (r.navEnd + r.band < r.benchEnd) {
+            // Shortfall beyond the band (`d < −band`). If it exceeds the bond, the rest stays with depositors
+            // (MATH.md §9.2).
+            uint256 excessShortfall = r.benchEnd - r.navEnd - r.band;
+            // forge-lint: disable-next-line(reentrancy-events)
+            if (excessShortfall > r.payout) emit IOathVault.BondExhausted(excessShortfall - r.payout);
+        }
+
+        // 9. Record.
+        r.start = epochStart;
+        r.end = epochEnd;
+        r.startTick = b.startTick;
+        r.navStart = b.navStart;
+        r.bondAfter = bondBalance;
+        uint256 epoch = results.length;
+        results.push(r);
+        // forge-lint: disable-next-line(reentrancy-events)
+        emit IOathVault.Settled(epoch, r);
+    }
+
     // ---------------------------------------------------------------- position
 
     /// @notice The PoolManager's callback for the vault's own `unlock`. PoolManager only: the PoolManager calls
@@ -409,6 +479,18 @@ contract OathVault is ERC20, IUnlockCallback, ReentrancyGuardTransient {
     /// @notice The curator: posts the bond, starts epochs and rebalances.
     function curator() external view returns (address) {
         return CURATOR;
+    }
+
+    /// @notice Whether `settle` may be called: `state == ACTIVE && now ≥ epochEnd`.
+    function isSettleable() external view returns (bool) {
+        // forge-lint: disable-next-line(block-timestamp)
+        return state == IOathVault.State.ACTIVE && block.timestamp >= epochEnd;
+    }
+
+    /// @notice The result of settled epoch `i`, `0 ≤ i < epochCount()`.
+    /// @param i Epoch index.
+    function getResult(uint256 i) external view returns (IOathVault.EpochResult memory) {
+        return results[i];
     }
 
     /// @notice Number of settled epochs; also the index of the current epoch while ACTIVE.
@@ -472,6 +554,23 @@ contract OathVault is ERC20, IUnlockCallback, ReentrancyGuardTransient {
         if (shares == 0) revert IOathVault.ZeroShares();
         used0 = FullMath.mulDivRoundingUp(h0, shares, supply);
         used1 = FullMath.mulDivRoundingUp(h1, shares, supply);
+    }
+
+    /// @dev The vault's position marked at `E` for MATH.md §7: fee growth inside when its fees were last
+    ///      collected (`getPositionInfo`), and the hook's snapshot of fee growth inside at `E` as the mark. With
+    ///      `positionLiquidity == 0` the marks are irrelevant: fees and principal are 0.
+    function _positionAtEnd(IOathHook.Epoch memory e) private view returns (ValuationLib.Position memory) {
+        (int24 lower, int24 upper) = (positionLower, positionUpper);
+        (, uint256 last0, uint256 last1) = MANAGER.getPositionInfo(POOL_ID, address(this), lower, upper, POSITION_SALT);
+        return ValuationLib.Position({
+            liquidity: positionLiquidity,
+            tickLower: lower,
+            tickUpper: upper,
+            feeGrowthInside0Last: last0,
+            feeGrowthInside1Last: last1,
+            feeGrowthInside0Mark: e.fgIn0,
+            feeGrowthInside1Mark: e.fgIn1
+        });
     }
 
     /// @dev Range rule for `startEpoch` and `rebalance`: `tickLower < tickUpper`, both multiples of `tickSpacing`,

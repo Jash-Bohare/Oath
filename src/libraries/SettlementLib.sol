@@ -37,6 +37,7 @@ library SettlementLib {
     /// @return feeShares Shares to mint to the curator.
     /// @return diff `NAV_E − B_E`.
     /// @return band The band in currency1 units.
+    // forge-lint: disable-next-line(internal-function-used-once)
     function settle(uint256 navEnd, uint256 benchEnd, uint256 bond, uint256 supply, uint16 bandBps, uint16 perfFeeBps)
         internal
         pure

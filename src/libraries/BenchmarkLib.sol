@@ -87,6 +87,7 @@ library BenchmarkLib {
     /// @return benchValue Benchmark value `B_E` in raw currency1 units.
     /// @return fees0 Benchmark fees in currency0 over the epoch.
     /// @return fees1 Benchmark fees in currency1 over the epoch.
+    // forge-lint: disable-next-line(internal-function-used-once)
     function valueAt(
         IOathVault.Benchmark memory benchmark,
         uint256 g0End,

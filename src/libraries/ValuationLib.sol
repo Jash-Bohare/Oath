@@ -97,6 +97,7 @@ library ValuationLib {
     /// @return navValue Vault value in raw currency1 units.
     /// @return fees0 Uncollected currency0 fees `u0`.
     /// @return fees1 Uncollected currency1 fees `u1`.
+    // forge-lint: disable-next-line(internal-function-used-once)
     function nav(uint256 idle0, uint256 idle1, Position memory position, uint160 sqrtPriceX96)
         internal
         pure
