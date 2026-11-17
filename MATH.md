@@ -168,7 +168,7 @@ Context for the loss example: HODL 50/50 would be $27,184.45. The curator's tigh
 ### 9.3 Why the comparison is fair
 
 - **Same marks:** vault and benchmark are both valued at `sqrtP_S` at start (they start equal by construction, §6.1) and at `sqrtP_E` at the end. Spot-price manipulation at `E` cannot shift one relative to the other because neither uses spot.
-- **Same fee source:** both draw from the same pool's fee growth. Under arbitrage-driven flow the benchmark is exact (§13 F3, to the wei); under fixed-size flow it understates fees, which favours the curator by at most the measured error, absorbed by the 35 bps band at ≤ 0.25% of active liquidity.
+- **Same fee source:** both draw from the same pool's fee growth. Under arbitrage-driven flow the benchmark is exact (§13 F3, to the wei); under fixed-size flow it understates fees, and total value differs from a real position by at most the measured 34 bps (in either direction), absorbed by the 35 bps band at ≤ 0.25% of active liquidity.
 - **Costs count:** the vault pays swap fees and price impact on its own rebalances; the benchmark pays nothing. A curator must beat passive **after** costs.
 - **No look-ahead:** the epoch boundary snapshot is exact and taken before any post-`E` activity can affect it (§8).
 
