@@ -159,7 +159,7 @@ Context for the loss example: HODL 50/50 would be $27,184.45. The curator's tigh
 
 | Case | Behaviour |
 | --- | --- |
-| `B_E == 0` | Cannot happen if `V_S > 0`; reverts `ZeroBenchmark()` defensively |
+| `B_E == 0` | Only for a dust vault: the benchmark starts up to `6u` below `V_S` by rounding (§6.1), so with `V_S ≤ 6u` it can be worth 0 at `E`. No verdict: no payout, no fee (`band = 0`, `d = NAV_E`), and settlement completes |
 | Shortfall larger than the bond | `payout = bond`; the remaining shortfall stays with depositors; the vault emits `BondExhausted(shortfallUncovered)` |
 | `fee ≥ NAV_E` | Impossible: `fee ≤ (d − band) · perfFeeBps / 10,000 ≤ d < NAV_E` (perfFeeBps ≤ 5,000); asserted anyway |
 | `totalShares` includes the dead shares | Yes; fee dilution applies to everyone pro-rata, including dead shares |

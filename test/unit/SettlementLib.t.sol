@@ -26,15 +26,6 @@ contract SettlementLibTest is Test {
     uint256 internal constant DG0 = 5685705715728585446726598611346846337347; // MATH.md §13, F2
     uint256 internal constant DG1 = 10323568296605520673412669325024;
 
-    /// @dev External wrapper so library reverts can be caught with `expectRevert`.
-    function settleExt(uint256 nav, uint256 bench, uint256 bond, uint256 supply, uint16 bandBps, uint16 perfBps)
-        external
-        pure
-        returns (uint256, uint256, uint256, int256, uint256)
-    {
-        return SettlementLib.settle(nav, bench, bond, supply, bandBps, perfBps);
-    }
-
     // ---------------------------------------------------------------- MATH.md §9.1 worked examples
 
     /// @dev Loss (real Nov 8–15 move, end $1,816.25): NAV $24,515.96, B_E $27,057.50, d −$2,541.54,
@@ -174,9 +165,17 @@ contract SettlementLibTest is Test {
         assertEq(payout, 0);
     }
 
-    function test_settle_zeroBenchmarkReverts() public {
-        vm.expectRevert(SettlementLib.ZeroBenchmark.selector);
-        this.settleExt(1, 0, BOND, SUPPLY, BAND, PERF);
+    /// @dev A zero benchmark (only possible for a dust vault, MATH.md §9.2) gives no verdict instead of reverting,
+    ///      so settlement always completes: no payout, no fee, `band = 0`, `d = NAV_E`.
+    function testFuzz_settle_zeroBenchmarkNoVerdict(uint256 nav, uint256 bond) public pure {
+        nav = bound(nav, 0, 1e30);
+        (uint256 payout, uint256 fee, uint256 feeShares, int256 diff, uint256 band) =
+            SettlementLib.settle(nav, 0, bond, SUPPLY, BAND, PERF);
+        assertEq(payout, 0);
+        assertEq(fee, 0);
+        assertEq(feeShares, 0);
+        assertEq(diff, int256(nav));
+        assertEq(band, 0);
     }
 
     /// @dev A zero NAV against a positive benchmark is a full shortfall, not a revert.

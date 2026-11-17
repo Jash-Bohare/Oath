@@ -14,9 +14,6 @@ library SettlementLib {
     /// @notice Basis-point denominator.
     uint256 internal constant BPS = 10_000;
 
-    /// @notice The benchmark is worth zero; impossible when the epoch started with a positive NAV.
-    error ZeroBenchmark();
-
     /// @notice Settles one epoch (MATH.md §9):
     ///         `d = NAV_E − B_E`, `band = mulDiv(B_E, bandBps, 10,000)`;
     ///         `d < −band` → `payout = min(−d − band, bond)`;
@@ -26,6 +23,9 @@ library SettlementLib {
     ///      `supply` includes the dead shares, so the dilution is pro-rata for everyone. Every amount paid to
     ///      the curator rounds down. A shortfall larger than the bond leaves `−d − band − payout` with
     ///      depositors (the vault emits `BondExhausted`).
+    ///      `B_E == 0` gives no verdict (no payout, no fee, `band = 0`, `diff = NAV_E`) so that settlement always
+    ///      completes. It happens only for a dust vault: the benchmark starts up to `6u` below `V_S` by rounding
+    ///      (MATH.md §6.1, §9.2), so with `V_S ≤ 6u` it can be worth nothing at `E`.
     /// @param navEnd Vault NAV at `E`, `NAV_E` (raw currency1 units).
     /// @param benchEnd Benchmark value at `E`, `B_E` (raw currency1 units).
     /// @param bond Curator bond available for a payout (raw currency1 units).
@@ -43,9 +43,8 @@ library SettlementLib {
         pure
         returns (uint256 payout, uint256 fee, uint256 feeShares, int256 diff, uint256 band)
     {
-        if (benchEnd == 0) revert ZeroBenchmark();
-
         diff = SafeCast.toInt256(navEnd) - SafeCast.toInt256(benchEnd);
+        if (benchEnd == 0) return (0, 0, 0, diff, 0); // dust vault: nothing to measure against
         band = FullMath.mulDiv(benchEnd, bandBps, BPS);
 
         if (diff < -SafeCast.toInt256(band)) {

@@ -602,3 +602,37 @@ contract OathVaultSettleNativeTest is OathVaultTestBase {
         );
     }
 }
+
+/// @notice Regression (found by the invariant suite): an epoch started on a dust vault, here only a speck of
+///         currency0 sent straight to the vault (start NAV of 2 raw units), has a benchmark worth 0 at `E` after
+///         rounding (MATH.md §6.1, §9.2). Settlement must still complete, with no verdict, and reopen the vault;
+///         it used to revert `ZeroBenchmark()` forever and leave the vault stuck ACTIVE.
+contract OathVaultSettleDustTest is OathVaultTestBase {
+    function setUp() public override {
+        super.setUp();
+        _createVault(currency0);
+        _seedPool(POOL_LIQUIDITY);
+    }
+
+    function test_settle_dustVaultSettlesWithoutVerdict() public {
+        _fund(c0, address(this), 1_247_579_248);
+        c0.transfer(address(vault), 1_247_579_248);
+        _wait(1 hours);
+        _startEpoch(-200640, -197740, _noSwap());
+        (,,,,, uint256 navStart,) = vault.benchmark();
+        assertEq(navStart, 2, "dust start NAV");
+
+        vm.roll(_block() + 1);
+        vm.warp(vault.epochEnd());
+        vault.settle();
+
+        IOathVault.EpochResult memory r = vault.getResult(0);
+        assertEq(r.benchEnd, 0, "benchmark rounds to zero");
+        assertEq(r.payout, 0, "no payout");
+        assertEq(r.fee, 0, "no fee");
+        assertEq(r.feeShares, 0);
+        assertEq(r.band, 0);
+        assertEq(r.diff, int256(r.navEnd));
+        assertEq(uint8(vault.state()), uint8(IOathVault.State.OPEN), "vault reopened");
+    }
+}
