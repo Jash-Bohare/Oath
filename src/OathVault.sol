@@ -9,10 +9,17 @@ import {Math} from "@openzeppelin/contracts/utils/math/Math.sol";
 import {ReentrancyGuardTransient} from "@openzeppelin/contracts/utils/ReentrancyGuardTransient.sol";
 import {IPoolManager} from "@uniswap/v4-core/src/interfaces/IPoolManager.sol";
 import {IHooks} from "@uniswap/v4-core/src/interfaces/IHooks.sol";
+import {IUnlockCallback} from "@uniswap/v4-core/src/interfaces/callback/IUnlockCallback.sol";
 import {FullMath} from "@uniswap/v4-core/src/libraries/FullMath.sol";
+import {StateLibrary} from "@uniswap/v4-core/src/libraries/StateLibrary.sol";
+import {TickMath} from "@uniswap/v4-core/src/libraries/TickMath.sol";
+import {BalanceDelta} from "@uniswap/v4-core/src/types/BalanceDelta.sol";
 import {Currency} from "@uniswap/v4-core/src/types/Currency.sol";
 import {PoolKey} from "@uniswap/v4-core/src/types/PoolKey.sol";
 import {PoolId} from "@uniswap/v4-core/src/types/PoolId.sol";
+import {ModifyLiquidityParams, SwapParams} from "@uniswap/v4-core/src/types/PoolOperation.sol";
+import {LiquidityAmounts} from "@uniswap/v4-periphery/src/libraries/LiquidityAmounts.sol";
+import {CurrencySettler} from "@openzeppelin/uniswap-hooks/utils/CurrencySettler.sol";
 import {IOathHook} from "./interfaces/IOathHook.sol";
 import {IOathVault} from "./interfaces/IOathVault.sol";
 
@@ -22,13 +29,22 @@ import {IOathVault} from "./interfaces/IOathVault.sol";
 ///         counterfactual (MATH.md §6, §9). Created only by `OathFactory`, which also creates its pool.
 /// @dev Pool key and parameters are fixed at creation and held as immutables. Values are in raw currency1 units
 ///      (MATH.md §1).
-contract OathVault is ERC20, ReentrancyGuardTransient {
+contract OathVault is ERC20, IUnlockCallback, ReentrancyGuardTransient {
     using SafeERC20 for IERC20;
+    using StateLibrary for IPoolManager;
+    using CurrencySettler for Currency;
+
+    /// @dev What the vault's own `unlock` does in `unlockCallback`.
+    enum Action {
+        REPOSITION
+    }
 
     /// @notice Shares minted to `DEAD` on the first deposit, so the share price cannot be inflated (MATH.md §11).
     uint256 public constant MIN_SHARES = 1_000;
     /// @notice Holder of the permanently locked `MIN_SHARES`.
     address public constant DEAD = 0x000000000000000000000000000000000000dEaD;
+    /// @notice Salt of the vault's single pool position.
+    bytes32 public constant POSITION_SALT = bytes32(0);
 
     IPoolManager private immutable MANAGER;
     IOathHook private immutable HOOK;
@@ -62,6 +78,12 @@ contract OathVault is ERC20, ReentrancyGuardTransient {
     uint32 public openSince;
     /// @notice The hook's tick cumulative at `T0`, the start of the open-window TWAP (MATH.md §5).
     int256 public cumAtOpen;
+    /// @notice Liquidity `L_v` of the vault's position. Zero in the open window.
+    uint128 public positionLiquidity;
+    /// @notice Lower tick of the vault's position.
+    int24 public positionLower;
+    /// @notice Upper tick of the vault's position.
+    int24 public positionUpper;
 
     /// @dev Called by `OathFactory`, which becomes `factory()`. The factory validates `params`, rejects a zero
     ///      curator and builds `key` with this pool's hook, so the vault does not re-check them.
@@ -234,6 +256,21 @@ contract OathVault is ERC20, ReentrancyGuardTransient {
         _startOpenWindow();
     }
 
+    // ---------------------------------------------------------------- position
+
+    /// @notice The PoolManager's callback for the vault's own `unlock`. PoolManager only: the PoolManager calls
+    ///         back the contract that unlocked it, so only the vault's own repositions reach this.
+    /// @dev Reverts `OnlyManager()`. See `_onReposition` for the steps.
+    /// @param data `abi.encode(Action.REPOSITION, tickLower, tickUpper, swap)`.
+    /// @return Empty bytes.
+    function unlockCallback(bytes calldata data) external returns (bytes memory) {
+        if (msg.sender != address(MANAGER)) revert IOathVault.OnlyManager();
+        (, int24 tickLower, int24 tickUpper, IOathVault.SwapIntent memory swap) =
+            abi.decode(data, (Action, int24, int24, IOathVault.SwapIntent));
+        _onReposition(tickLower, tickUpper, swap);
+        return "";
+    }
+
     // ---------------------------------------------------------------- views
 
     /// @notice Idle currency0: the vault's currency0 balance (its ETH balance if currency0 is native).
@@ -264,6 +301,14 @@ contract OathVault is ERC20, ReentrancyGuardTransient {
     /// @notice The curator: posts the bond, starts epochs and rebalances.
     function curator() external view returns (address) {
         return CURATOR;
+    }
+
+    /// @notice The vault's current position.
+    /// @return lower Lower tick.
+    /// @return upper Upper tick.
+    /// @return liquidity Liquidity `L_v`.
+    function positionInfo() external view returns (int24 lower, int24 upper, uint128 liquidity) {
+        return (positionLower, positionUpper, positionLiquidity);
     }
 
     /// @notice The vault's pool key.
@@ -314,6 +359,109 @@ contract OathVault is ERC20, ReentrancyGuardTransient {
         if (shares == 0) revert IOathVault.ZeroShares();
         used0 = FullMath.mulDivRoundingUp(h0, shares, supply);
         used1 = FullMath.mulDivRoundingUp(h1, shares, supply);
+    }
+
+    /// @dev Moves the vault's position to `[tickLower, tickUpper)`, with an optional swap in between, in one
+    ///      `unlock` of the PoolManager (`_onReposition`).
+    function _reposition(int24 tickLower, int24 tickUpper, IOathVault.SwapIntent calldata swap) private {
+        // forge-lint: disable-next-line(unused-return)
+        MANAGER.unlock(abi.encode(Action.REPOSITION, tickLower, tickUpper, swap)); // the callback returns nothing
+    }
+
+    /// @dev The reposition, inside the unlock:
+    ///      1. If the vault has a position, remove all of it. The credit is principal plus all uncollected fees.
+    ///      2. If `swap.amountSpecified != 0`, swap; exact input only (`amountSpecified < 0`), else
+    ///         `ExactInputOnly()`.
+    ///      3. Settle both currencies' net deltas (take credits, pay debts from idle), then require
+    ///         `balance1 ≥ bondBalance`, else `BondTouched()`: a reposition never spends the bond.
+    ///      4. Add the most liquidity the idle balances buy at the current price:
+    ///         `L_new = getLiquidityForAmounts(sqrtP, sqrtAt(lower), sqrtAt(upper), idle0 − 1, idle1 − 1)`,
+    ///         saturating at 0. The 1-wei buffer absorbs the pool's round-up of the amounts it charges.
+    ///      5. Store the new range and `L_new`.
+    ///      The hook's intra-block guard runs on steps 1 and 4, so the whole reposition reverts if the price moved
+    ///      more than `maxIntraBlockTicks` within the block, including through the curator's own swap.
+    function _onReposition(int24 tickLower, int24 tickUpper, IOathVault.SwapIntent memory swap) private {
+        // The PoolManager is trusted and every entry point holds the vault's reentrancy lock, so the position is
+        // safely stored after the calls below. `callerDelta` already includes the fees, so `feesAccrued` is unused.
+        PoolKey memory key = poolKey();
+        BalanceDelta delta;
+        uint128 liquidity = positionLiquidity;
+        if (liquidity > 0) {
+            // forge-lint: disable-next-item(reentrancy-no-eth,unused-return)
+            (delta,) = MANAGER.modifyLiquidity(
+                key,
+                ModifyLiquidityParams({
+                    tickLower: positionLower,
+                    tickUpper: positionUpper,
+                    liquidityDelta: -int256(uint256(liquidity)),
+                    salt: POSITION_SALT
+                }),
+                ""
+            );
+        }
+        if (swap.amountSpecified != 0) {
+            if (swap.amountSpecified > 0) revert IOathVault.ExactInputOnly();
+            // forge-lint: disable-next-item(reentrancy-no-eth)
+            delta = delta
+                + MANAGER.swap(
+                    key,
+                    SwapParams({
+                        zeroForOne: swap.zeroForOne,
+                        amountSpecified: swap.amountSpecified,
+                        sqrtPriceLimitX96: swap.sqrtPriceLimitX96
+                    }),
+                    ""
+                );
+        }
+        _settle(delta);
+        if (CURRENCY1.balanceOfSelf() < bondBalance) revert IOathVault.BondTouched();
+
+        (uint160 sqrtPriceX96,,,) = MANAGER.getSlot0(POOL_ID);
+        uint128 newLiquidity = LiquidityAmounts.getLiquidityForAmounts(
+            sqrtPriceX96,
+            TickMath.getSqrtPriceAtTick(tickLower),
+            TickMath.getSqrtPriceAtTick(tickUpper),
+            _lessOneWei(idle0()),
+            _lessOneWei(idle1())
+        );
+        if (newLiquidity > 0) {
+            // forge-lint: disable-next-item(reentrancy-no-eth,unused-return)
+            (BalanceDelta added,) = MANAGER.modifyLiquidity(
+                key,
+                ModifyLiquidityParams({
+                    tickLower: tickLower,
+                    tickUpper: tickUpper,
+                    liquidityDelta: int256(uint256(newLiquidity)),
+                    salt: POSITION_SALT
+                }),
+                ""
+            );
+            _settle(added);
+        }
+        positionLower = tickLower;
+        positionUpper = tickUpper;
+        positionLiquidity = newLiquidity;
+    }
+
+    /// @dev Clears the vault's deltas with the PoolManager: takes each credit into the vault and pays each debt
+    ///      from the vault's balance.
+    function _settle(BalanceDelta delta) private {
+        _settleCurrency(CURRENCY0, delta.amount0());
+        _settleCurrency(CURRENCY1, delta.amount1());
+    }
+
+    /// @dev Takes `amount > 0` of `currency` from the PoolManager, or pays `−amount` if negative.
+    function _settleCurrency(Currency currency, int128 amount) private {
+        // Both casts are of a positive int128, so they cannot truncate.
+        // forge-lint: disable-next-line(unsafe-typecast)
+        if (amount > 0) currency.take(MANAGER, address(this), uint128(amount), false);
+        // forge-lint: disable-next-line(unsafe-typecast)
+        else if (amount < 0) currency.settle(MANAGER, address(this), uint128(-amount), false);
+    }
+
+    /// @dev `amount − 1`, or 0 if `amount` is 0.
+    function _lessOneWei(uint256 amount) private pure returns (uint256) {
+        return amount == 0 ? 0 : amount - 1;
     }
 
     /// @dev Starts an open window at now: records `T0` and the hook's cumulative at `T0`.

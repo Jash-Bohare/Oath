@@ -157,3 +157,30 @@ contract OathVaultOpenWindowTest is OathVaultTestBase {
         assertEq(vault.totalSupply(), supply);
     }
 }
+
+/// @notice Starting an epoch and moving the vault's position, on a vault created through the real factory.
+contract OathVaultStartEpochTest is OathVaultTestBase {
+    function setUp() public override {
+        super.setUp();
+        _createVault(currency0);
+    }
+
+    // ---------------------------------------------------------------- reposition
+
+    /// @dev The vault starts with no position.
+    function test_reposition_noPositionAtCreation() public view {
+        (int24 lower, int24 upper, uint128 liquidity) = vault.positionInfo();
+        assertEq(lower, 0);
+        assertEq(upper, 0);
+        assertEq(liquidity, 0);
+        assertEq(vault.POSITION_SALT(), bytes32(0));
+    }
+
+    /// @dev Only the PoolManager may call back into the vault.
+    function testFuzz_reposition_callbackOnlyManager(address caller) public {
+        vm.assume(caller != address(manager));
+        vm.prank(caller);
+        vm.expectRevert(IOathVault.OnlyManager.selector);
+        vault.unlockCallback("");
+    }
+}
