@@ -22,6 +22,8 @@ import {LiquidityAmounts} from "@uniswap/v4-periphery/src/libraries/LiquidityAmo
 import {CurrencySettler} from "@openzeppelin/uniswap-hooks/utils/CurrencySettler.sol";
 import {IOathHook} from "./interfaces/IOathHook.sol";
 import {IOathVault} from "./interfaces/IOathVault.sol";
+import {BenchmarkLib} from "./libraries/BenchmarkLib.sol";
+import {ValuationLib} from "./libraries/ValuationLib.sol";
 
 /// @title OathVault
 /// @notice A curated two-token vault in one Oath pool. Depositors receive ERC-20 shares; the curator posts a
@@ -43,6 +45,8 @@ contract OathVault is ERC20, IUnlockCallback, ReentrancyGuardTransient {
     uint256 public constant MIN_SHARES = 1_000;
     /// @notice Holder of the permanently locked `MIN_SHARES`.
     address public constant DEAD = 0x000000000000000000000000000000000000dEaD;
+    /// @dev Basis-point denominator.
+    uint256 private constant BPS = 10_000;
     /// @notice Salt of the vault's single pool position.
     bytes32 public constant POSITION_SALT = bytes32(0);
 
@@ -68,8 +72,7 @@ contract OathVault is ERC20, IUnlockCallback, ReentrancyGuardTransient {
     uint16 private immutable CAP_BPS;
 
     /// @notice Current lifecycle state. Deposits and withdrawals happen only while OPEN.
-    /// @dev OPEN (the zero value) until `startEpoch` exists to move it to ACTIVE.
-    // forge-lint: disable-next-line(uninitialized-state)
+    /// @dev OPEN (the zero value) at creation; `startEpoch` moves it to ACTIVE.
     IOathVault.State public state;
     /// @notice Currency1 held as the curator's bond. Part of the vault's currency1 balance, but not of `idle1`
     ///         or of NAV.
@@ -78,12 +81,24 @@ contract OathVault is ERC20, IUnlockCallback, ReentrancyGuardTransient {
     uint32 public openSince;
     /// @notice The hook's tick cumulative at `T0`, the start of the open-window TWAP (MATH.md §5).
     int256 public cumAtOpen;
+    /// @notice Current or last epoch start `S`.
+    uint32 public epochStart;
+    /// @notice Current or last epoch end `E`.
+    uint32 public epochEnd;
+    /// @notice Time of the last `startEpoch` or `rebalance`.
+    uint32 public lastReposition;
     /// @notice Liquidity `L_v` of the vault's position. Zero in the open window.
     uint128 public positionLiquidity;
     /// @notice Lower tick of the vault's position.
     int24 public positionLower;
     /// @notice Upper tick of the vault's position.
     int24 public positionUpper;
+    /// @notice The current epoch's benchmark (MATH.md §6.1).
+    IOathVault.Benchmark public benchmark;
+    /// @notice Results of the settled epochs, in order.
+    /// @dev Empty until settlement exists to append to it.
+    // forge-lint: disable-next-line(uninitialized-state)
+    IOathVault.EpochResult[] public results;
 
     /// @dev Called by `OathFactory`, which becomes `factory()`. The factory validates `params`, rejects a zero
     ///      curator and builds `key` with this pool's hook, so the vault does not re-check them.
@@ -256,6 +271,70 @@ contract OathVault is ERC20, IUnlockCallback, ReentrancyGuardTransient {
         _startOpenWindow();
     }
 
+    // ---------------------------------------------------------------- epoch
+
+    /// @notice Starts an epoch: marks the vault at the open-window TWAP, creates the benchmark, checks the size
+    ///         cap and the bond, schedules the hook's end-of-epoch checkpoints and opens the curator's position.
+    ///         Curator only, OPEN only. Steps (MATH.md §5, §6.1, §10):
+    ///         1. `W ≤ now − T0 ≤ maxOpen`.
+    ///         2. Start price: `startTick = floorDiv(hook.cumulativeNow − cumAtOpen, now − T0)`,
+    ///            `sqrtP_S = getSqrtPriceAtTick(startTick)`.
+    ///         3. `navStart = value(idle0, idle1, sqrtP_S)` (the vault holds no position yet), `> 0`.
+    ///         4. Benchmark `(L_b, r0, r1) = BenchmarkLib.create(navStart, sqrtP_S)` with the current global fee
+    ///            growth `G0, G1`.
+    ///         5. Cap `L_b ≤ activeLiquidity · capBps / 10,000` and bond `≥ navStart · minBondBps / 10,000`.
+    ///         6. `S = now`, `E = now + epochDuration`, ACTIVE; the hook schedules its checkpoints at `E − W`
+    ///            and `E`.
+    ///         7. Reposition into `[tickLower, tickUpper)` with the optional swap.
+    /// @dev The start price is a TWAP over at least `W`, so moving the spot price at `startEpoch` does not set it,
+    ///      and the vault and benchmark both start at `navStart` (MATH.md §6.1). Reverts, in this order:
+    ///      `NotCurator()`, `NotOpen()`, `BadRange()`, `OpenWindowTooShort()`, `OpenWindowExpired()`,
+    ///      `EmptyVault()`, `VaultTooLarge()`, `BondTooSmall()`; then the reposition's own errors
+    ///      (`ExactInputOnly()`, `BondTouched()`, the hook's guard).
+    /// @param tickLower Lower tick of the curator's range.
+    /// @param tickUpper Upper tick of the curator's range.
+    /// @param swap Optional exact-input swap before adding liquidity (`amountSpecified == 0`: none).
+    function startEpoch(int24 tickLower, int24 tickUpper, IOathVault.SwapIntent calldata swap) external nonReentrant {
+        if (msg.sender != CURATOR) revert IOathVault.NotCurator();
+        if (state != IOathVault.State.OPEN) revert IOathVault.NotOpen();
+        _checkRange(tickLower, tickUpper);
+
+        // forge-lint: disable-next-line(unsafe-typecast)
+        uint32 nowTs = uint32(block.timestamp); // fits until 2106
+        uint32 elapsed = nowTs - openSince;
+        if (elapsed < TWAP_WINDOW) revert IOathVault.OpenWindowTooShort();
+        if (elapsed > MAX_OPEN) revert IOathVault.OpenWindowExpired();
+
+        PoolKey memory key = poolKey();
+        int24 startTick = _twapTick(HOOK.cumulativeNow(key) - cumAtOpen, elapsed);
+        uint160 sqrtPriceStart = TickMath.getSqrtPriceAtTick(startTick);
+        uint256 navStart = ValuationLib.value(idle0(), idle1(), sqrtPriceStart);
+        if (navStart == 0) revert IOathVault.EmptyVault();
+
+        (uint128 benchLiquidity, uint256 r0, uint256 r1) = BenchmarkLib.create(navStart, sqrtPriceStart, TICK_SPACING);
+        (uint256 g0, uint256 g1) = MANAGER.getFeeGrowthGlobals(POOL_ID);
+        if (benchLiquidity > FullMath.mulDiv(MANAGER.getLiquidity(POOL_ID), CAP_BPS, BPS)) {
+            revert IOathVault.VaultTooLarge();
+        }
+        if (bondBalance < FullMath.mulDiv(navStart, MIN_BOND_BPS, BPS)) revert IOathVault.BondTooSmall();
+        benchmark = IOathVault.Benchmark({
+            L: benchLiquidity, r0: r0, r1: r1, G0: g0, G1: g1, navStart: navStart, startTick: startTick
+        });
+
+        uint32 end = nowTs + EPOCH_DURATION;
+        epochStart = nowTs;
+        epochEnd = end;
+        state = IOathVault.State.ACTIVE;
+        lastReposition = nowTs;
+
+        emit IOathVault.EpochStarted(
+            results.length, nowTs, end, startTick, navStart, benchLiquidity, tickLower, tickUpper
+        );
+
+        HOOK.openEpoch(key, end, TWAP_WINDOW);
+        _reposition(tickLower, tickUpper, swap);
+    }
+
     // ---------------------------------------------------------------- position
 
     /// @notice The PoolManager's callback for the vault's own `unlock`. PoolManager only: the PoolManager calls
@@ -301,6 +380,11 @@ contract OathVault is ERC20, IUnlockCallback, ReentrancyGuardTransient {
     /// @notice The curator: posts the bond, starts epochs and rebalances.
     function curator() external view returns (address) {
         return CURATOR;
+    }
+
+    /// @notice Number of settled epochs; also the index of the current epoch while ACTIVE.
+    function epochCount() external view returns (uint256) {
+        return results.length;
     }
 
     /// @notice The vault's current position.
@@ -359,6 +443,27 @@ contract OathVault is ERC20, IUnlockCallback, ReentrancyGuardTransient {
         if (shares == 0) revert IOathVault.ZeroShares();
         used0 = FullMath.mulDivRoundingUp(h0, shares, supply);
         used1 = FullMath.mulDivRoundingUp(h1, shares, supply);
+    }
+
+    /// @dev Range rule for `startEpoch` and `rebalance`: `tickLower < tickUpper`, both multiples of `tickSpacing`,
+    ///      both within the usable ticks `[minUsableTick, maxUsableTick]`. Reverts `BadRange()`.
+    function _checkRange(int24 tickLower, int24 tickUpper) private view {
+        if (
+            tickLower >= tickUpper || tickLower % TICK_SPACING != 0 || tickUpper % TICK_SPACING != 0
+                || tickLower < TickMath.minUsableTick(TICK_SPACING) || tickUpper > TickMath.maxUsableTick(TICK_SPACING)
+        ) revert IOathVault.BadRange();
+    }
+
+    /// @dev The TWAP tick over `elapsed` seconds whose tick cumulative grew by `cumulativeDelta` (MATH.md §4):
+    ///      `floorDiv(cumulativeDelta, elapsed)`, rounding toward −∞ (if the quotient is negative and there is a
+    ///      remainder, subtract 1), as Uniswap v3's oracle does. `elapsed > 0`.
+    function _twapTick(int256 cumulativeDelta, uint32 elapsed) private pure returns (int24) {
+        int256 dt = int256(uint256(elapsed));
+        int256 tick = cumulativeDelta / dt;
+        if (cumulativeDelta < 0 && cumulativeDelta % dt != 0) tick--;
+        // A time-weighted mean of ticks in [MIN_TICK, MAX_TICK] stays in that range, so it fits int24.
+        // forge-lint: disable-next-line(unsafe-typecast)
+        return int24(tick);
     }
 
     /// @dev Moves the vault's position to `[tickLower, tickUpper)`, with an optional swap in between, in one

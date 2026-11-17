@@ -1,10 +1,15 @@
 // SPDX-License-Identifier: MIT
 pragma solidity 0.8.26;
 
+import {IPoolManager} from "@uniswap/v4-core/src/interfaces/IPoolManager.sol";
+import {StateLibrary} from "@uniswap/v4-core/src/libraries/StateLibrary.sol";
+import {TickMath} from "@uniswap/v4-core/src/libraries/TickMath.sol";
 import {Currency, CurrencyLibrary} from "@uniswap/v4-core/src/types/Currency.sol";
 import {PoolKey} from "@uniswap/v4-core/src/types/PoolKey.sol";
 import {PoolId} from "@uniswap/v4-core/src/types/PoolId.sol";
+import {IOathHook} from "../../src/interfaces/IOathHook.sol";
 import {IOathVault} from "../../src/interfaces/IOathVault.sol";
+import {BenchmarkLib} from "../../src/libraries/BenchmarkLib.sol";
 import {OathVault} from "../../src/OathVault.sol";
 import {OathHookTestBase} from "../utils/OathHookTestBase.sol";
 import {OathVaultTestBase} from "../utils/OathVaultTestBase.sol";
@@ -160,8 +165,13 @@ contract OathVaultOpenWindowTest is OathVaultTestBase {
 
 /// @notice Starting an epoch and moving the vault's position, on a vault created through the real factory.
 contract OathVaultStartEpochTest is OathVaultTestBase {
+    using StateLibrary for IPoolManager;
+
+    uint256 internal createdAt;
+
     function setUp() public override {
         super.setUp();
+        createdAt = vm.getBlockTimestamp();
         _createVault(currency0);
     }
 
@@ -182,5 +192,69 @@ contract OathVaultStartEpochTest is OathVaultTestBase {
         vm.prank(caller);
         vm.expectRevert(IOathVault.OnlyManager.selector);
         vault.unlockCallback("");
+    }
+
+    // ---------------------------------------------------------------- startEpoch
+
+    /// @dev The MATH.md §9.1 start, reproduced on-chain: $30,000 marked at the start tick (no swaps, so the
+    ///      open-window TWAP is the start tick), the benchmark's L_b = 317,220,452,305,763 passes the cap against
+    ///      the real pool's active liquidity, the bond is exactly 10%, and the curator's range [−199400, −199000)
+    ///      gets L_v ≈ 3.126048e16 with 0.261795 ETH left idle (reference model `oath_math.py`). Every piece of
+    ///      epoch state is set and the hook schedules the end-of-epoch checkpoints.
+    function test_start_workedExample() public {
+        _seedPool(POOL_LIQUIDITY);
+        _fundWorkedExample();
+        vm.warp(createdAt + 1 hours);
+        uint32 start = uint32(_time());
+        uint32 end = start + 7 days;
+        (uint128 benchL, uint256 r0, uint256 r1) =
+            BenchmarkLib.create(NAV_START, TickMath.getSqrtPriceAtTick(START_TICK), TICK_SPACING);
+        assertApproxEqAbs(benchL, 317_220_452_305_763, 1, "L_b (MATH.md 9.1)");
+
+        vm.expectEmit(true, false, false, true, address(vault));
+        emit IOathVault.EpochStarted(0, start, end, START_TICK, NAV_START, benchL, RANGE_LOWER, RANGE_UPPER);
+        _startEpoch(RANGE_LOWER, RANGE_UPPER, _noSwap());
+
+        // Benchmark: created at the start TWAP, with the fee growth at S (no swaps yet, so zero).
+        (uint128 l, uint256 br0, uint256 br1, uint256 g0, uint256 g1, uint256 navStart, int24 startTick) =
+            vault.benchmark();
+        assertEq(l, benchL, "L_b");
+        assertEq(br0, r0, "r0");
+        assertEq(br1, r1, "r1");
+        assertEq(g0, 0, "G0 at S");
+        assertEq(g1, 0, "G1 at S");
+        assertEq(navStart, NAV_START, "navStart");
+        assertEq(startTick, START_TICK, "startTick");
+
+        // Lifecycle.
+        assertEq(uint8(vault.state()), uint8(IOathVault.State.ACTIVE), "ACTIVE");
+        assertEq(vault.epochStart(), start, "S");
+        assertEq(vault.epochEnd(), end, "E");
+        assertEq(vault.lastReposition(), start, "lastReposition");
+        assertEq(vault.epochCount(), 0, "no settled epoch yet");
+
+        // Position: in the pool under the vault's salt, recorded by the hook for the boundary snapshot.
+        (int24 lower, int24 upper, uint128 liquidity) = vault.positionInfo();
+        assertEq(lower, RANGE_LOWER);
+        assertEq(upper, RANGE_UPPER);
+        assertApproxEqRel(liquidity, 3.126048e16, 1e12, "L_v (reference 3.126048e16)");
+        assertEq(_poolPositionLiquidity(RANGE_LOWER, RANGE_UPPER), liquidity, "pool position = L_v");
+        (,, int24 vaultLower, int24 vaultUpper) = hook.configs(key.toId());
+        assertEq(vaultLower, RANGE_LOWER, "hook range lower");
+        assertEq(vaultUpper, RANGE_UPPER, "hook range upper");
+
+        // Idle after adding: 0.261795 ETH; currency1 is the binding side, so only the 1-wei buffer and at most one
+        // more raw unit of round-up remain (1 <= idle1 <= 2).
+        assertApproxEqAbs(vault.idle0(), 0.261795e18, 0.000001e18, "idle0 (reference 0.261795 ETH)");
+        assertGe(vault.idle1(), 1, "idle1 keeps the 1-wei buffer");
+        assertLe(vault.idle1(), 2, "idle1 <= 2");
+        assertEq(vault.bondBalance(), BOND, "bond untouched");
+        assertEq(c1.balanceOf(address(vault)) - vault.idle1(), BOND, "bond still held");
+
+        // Hook: epoch open, checkpoints at E − W and E.
+        IOathHook.Epoch memory e = hook.epochData(key);
+        assertTrue(e.active, "hook epoch active");
+        assertEq(e.checkpointA, end - 30 minutes, "checkpoint A = E - W");
+        assertEq(e.checkpointB, end, "checkpoint B = E");
     }
 }

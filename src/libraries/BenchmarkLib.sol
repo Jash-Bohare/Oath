@@ -52,6 +52,7 @@ library BenchmarkLib {
     /// @return liquidity Benchmark liquidity `L_b`.
     /// @return r0 Leftover currency0.
     /// @return r1 Leftover currency1.
+    // forge-lint: disable-next-line(internal-function-used-once)
     function create(uint256 navStart, uint160 sqrtPriceX96, int24 tickSpacing)
         internal
         pure
