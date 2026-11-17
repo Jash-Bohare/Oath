@@ -1,9 +1,12 @@
 // SPDX-License-Identifier: MIT
 pragma solidity 0.8.26;
 
+import {IHooks} from "@uniswap/v4-core/src/interfaces/IHooks.sol";
 import {IPoolManager} from "@uniswap/v4-core/src/interfaces/IPoolManager.sol";
 import {StateLibrary} from "@uniswap/v4-core/src/libraries/StateLibrary.sol";
 import {TickMath} from "@uniswap/v4-core/src/libraries/TickMath.sol";
+import {Vm} from "forge-std/Vm.sol";
+import {CurrencyLibrary} from "@uniswap/v4-core/src/types/Currency.sol";
 import {IOathHook} from "../../src/interfaces/IOathHook.sol";
 import {IOathVault} from "../../src/interfaces/IOathVault.sol";
 import {BenchmarkLib} from "../../src/libraries/BenchmarkLib.sol";
@@ -60,6 +63,193 @@ contract OathVaultSettleTest is OathVaultTestBase {
         assertEq(r.startTick, START_TICK);
         assertEq(r.endTick, START_TICK, "price back at the start tick for the whole TWAP window");
         assertEq(r.navStart, NAV_START);
+    }
+
+    /// @dev The curator's tight range is left behind by a 2,079-tick fall to the MATH.md §9.1 loss price (−201275,
+    ///      $1,816.25): the vault ends almost all currency0 and falls with it, while the passive full-range
+    ///      benchmark loses less. The shortfall beyond the band is within the bond, so the bond pays exactly that
+    ///      to depositors: the payout stays in the vault and becomes idle. Without each side's own fees, the
+    ///      on-chain values match the reference model `oath_math.py` for this example within $0.01: NAV_E
+    ///      $24,493.812255 and B_E $27,038.251316 (MATH.md §9.1 lists them with illustrative fees added).
+    function test_settle_payoutPath() public {
+        _begin(RANGE_LOWER, RANGE_UPPER);
+        _nextBlock(1 days);
+        _moveToTick(-201275);
+        _toEnd();
+
+        IOathVault.EpochResult memory expected = _expected();
+        uint256 idle1Before = vault.idle1();
+        vm.recordLogs();
+        _settleAs(keeper);
+        _assertNoBondExhausted();
+
+        IOathVault.EpochResult memory r = vault.getResult(0);
+        assertEq(abi.encode(r), abi.encode(expected), "result = independent recomputation");
+        assertEq(r.endTick, -201275);
+        uint160 sqrtEnd = TickMath.getSqrtPriceAtTick(r.endTick);
+        assertApproxEqAbs(
+            r.navEnd - ValuationLib.value(r.vaultFees0, r.vaultFees1, sqrtEnd), 24_493_812_255, 10_000, "NAV_E ex fees"
+        );
+        assertApproxEqAbs(
+            r.benchEnd - ValuationLib.value(r.benchFees0, r.benchFees1, sqrtEnd), 27_038_251_316, 10_000, "B_E ex fees"
+        );
+        assertLt(r.diff, -int256(r.band), "shortfall beyond the band");
+        assertEq(r.payout, r.benchEnd - r.navEnd - r.band, "payout = excess shortfall");
+        assertGt(r.payout, 1_000e6, "a real loss (> $1,000)");
+        assertLt(r.payout, BOND, "within the bond");
+        assertEq(r.fee, 0);
+        assertEq(r.feeShares, 0);
+        assertEq(vault.bondBalance(), BOND - r.payout, "bond reduced");
+        assertEq(r.bondAfter, BOND - r.payout);
+        assertEq(c1.balanceOf(address(vault)), vault.idle1() + vault.bondBalance(), "payout tokens stay in the vault");
+        assertGe(vault.idle1(), idle1Before + r.payout, "payout is idle for depositors");
+        assertEq(vault.balanceOf(curator), 0);
+    }
+
+    /// @dev A shortfall beyond the band larger than the bond (a 7,000-tick fall, about −50%): the whole bond is
+    ///      paid and `BondExhausted` reports the uncovered rest, which stays with depositors.
+    function test_settle_bondExhausted() public {
+        _begin(RANGE_LOWER, RANGE_UPPER);
+        _nextBlock(1 days);
+        _moveToTick(START_TICK - 7_000);
+        _toEnd();
+
+        IOathVault.EpochResult memory expected = _expected();
+        uint256 excess = expected.benchEnd - expected.navEnd - expected.band;
+        assertGt(excess, BOND, "shortfall beyond the bond");
+        vm.expectEmit(false, false, false, true, address(vault));
+        emit IOathVault.BondExhausted(excess - BOND);
+        _settleAs(keeper);
+
+        IOathVault.EpochResult memory r = vault.getResult(0);
+        assertEq(abi.encode(r), abi.encode(expected));
+        assertEq(r.payout, BOND, "the whole bond");
+        assertEq(r.bondAfter, 0);
+        assertEq(vault.bondBalance(), 0);
+    }
+
+    /// @dev Flow keeps the price inside the curator's tight range, where its liquidity earns far more fees than
+    ///      the passive benchmark's; the price ends where it started, so principal is unchanged. The excess beyond
+    ///      the band earns the curator 20% as new shares: after minting it owns `fee / NAV_E` of the vault.
+    function test_settle_feePath() public {
+        _begin(RANGE_LOWER, RANGE_UPPER);
+        for (uint256 i; i < 30; ++i) {
+            _nextBlock(1 hours);
+            _moveToTick(START_TICK - 150);
+            _nextBlock(1 hours);
+            _moveToTick(START_TICK + 150);
+        }
+        _nextBlock(1 hours);
+        _moveToTick(START_TICK);
+        _toEnd();
+
+        IOathVault.EpochResult memory expected = _expected();
+        uint256 supplyBefore = vault.totalSupply();
+        vm.recordLogs();
+        _settleAs(keeper);
+        _assertNoBondExhausted();
+
+        IOathVault.EpochResult memory r = vault.getResult(0);
+        assertEq(abi.encode(r), abi.encode(expected), "result = independent recomputation");
+        assertGt(r.diff, int256(r.band), "outperformance beyond the band");
+        assertEq(r.fee, (uint256(r.diff) - r.band) * 2_000 / 10_000, "fee = 20% of the excess");
+        assertGt(r.feeShares, 0);
+        assertEq(r.payout, 0);
+        assertEq(vault.bondBalance(), BOND, "bond untouched");
+        assertEq(vault.balanceOf(curator), r.feeShares, "fee shares minted to the curator");
+        assertEq(vault.totalSupply(), supplyBefore + r.feeShares);
+        // The curator's shares are worth the fee at NAV_E, within one raw unit (MATH.md §9).
+        assertApproxEqAbs(r.feeShares * r.navEnd / vault.totalSupply(), r.fee, 1, "ownership = fee / NAV_E");
+    }
+
+    /// @dev MATH.md §7 / settlement step 3 against reality: with the price at the end TWAP and no swap since `E`,
+    ///      the unwind returns to the wei the principal at `sqrtP_E` plus the fees the settlement counted, so
+    ///      `NAV_E` is exactly what the depositors now hold (less the bond payout, which is added on top).
+    function test_settle_navEqualsRealUnwind() public {
+        _begin(RANGE_LOWER, RANGE_UPPER);
+        _swapAroundStart(4);
+        _nextBlock(1 hours);
+        _moveToTick(START_TICK - 60); // the end price, held through the whole TWAP window
+        _toEnd();
+
+        (int24 lower, int24 upper, uint128 liquidity) = vault.positionInfo();
+        uint256 idle0Before = vault.idle0();
+        uint256 idle1Before = vault.idle1();
+        _settleAs(keeper);
+        IOathVault.EpochResult memory r = vault.getResult(0);
+        assertEq(r.endTick, START_TICK - 60);
+        uint160 sqrtEnd = TickMath.getSqrtPriceAtTick(r.endTick);
+        (uint160 spot,,,) = manager.getSlot0(key.toId());
+        assertEq(spot, sqrtEnd, "spot = end TWAP");
+
+        (uint256 p0, uint256 p1) = ValuationLib.principal(liquidity, lower, upper, sqrtEnd);
+        assertGt(r.vaultFees0 + r.vaultFees1, 0, "fees counted");
+        assertEq(vault.idle0() - idle0Before, p0 + r.vaultFees0, "currency0 withdrawn = principal + fees");
+        assertEq(vault.idle1() - idle1Before - r.payout, p1 + r.vaultFees1, "currency1 withdrawn = principal + fees");
+        assertEq(ValuationLib.value(vault.idle0(), vault.idle1() - r.payout, sqrtEnd), r.navEnd, "NAV_E to the wei");
+    }
+
+    /// @dev If the vault ended with no liquidity, the hook's snapshot of fee growth inside reads an irrelevant
+    ///      range; NAV ignores it (fees and principal of zero liquidity are 0) and is the idle value at the end TWAP.
+    function test_settle_zeroLiquidityIgnoresSnapshot() public {
+        uint256 y = vault.idle1(); // swap all idle currency1: nothing left to pair in range, so L_v = 0
+        _startEpoch(
+            RANGE_LOWER,
+            RANGE_UPPER,
+            IOathVault.SwapIntent({
+                zeroForOne: false, amountSpecified: -int256(y), sqrtPriceLimitX96: TickMath.MAX_SQRT_PRICE - 1
+            })
+        );
+        startedAt = _time();
+        endsAt = startedAt + 7 days;
+        (,, uint128 liquidity) = vault.positionInfo();
+        assertEq(liquidity, 0);
+        _swapAroundStart(2);
+        _toEnd();
+
+        _settleAs(keeper);
+        IOathVault.EpochResult memory r = vault.getResult(0);
+        assertEq(r.vaultFees0, 0);
+        assertEq(r.vaultFees1, 0);
+        assertEq(
+            r.navEnd,
+            ValuationLib.value(vault.idle0(), vault.idle1() - r.payout, TickMath.getSqrtPriceAtTick(r.endTick)),
+            "NAV_E = idle value"
+        );
+    }
+
+    // ---------------------------------------------------------------- liveness
+
+    /// @dev Anyone can settle: the curator cannot hold depositors in an epoch.
+    function testFuzz_settle_byAnyone(address caller) public {
+        _begin(RANGE_LOWER, RANGE_UPPER);
+        _toEnd();
+        _settleAs(caller);
+        assertEq(uint8(vault.state()), uint8(IOathVault.State.OPEN));
+        assertEq(vault.epochCount(), 1);
+    }
+
+    /// @dev The unwind is guarded: if someone moved the price more than `maxIntraBlockTicks` earlier in the
+    ///      settlement block, `settle` reverts; anyone can retry in the next block. The result does not depend on
+    ///      the move (both sides are marked at the end TWAP).
+    function test_settle_retryNextBlock() public {
+        _begin(RANGE_LOWER, RANGE_UPPER);
+        _toEnd();
+        _moveToTick(START_TICK + 51);
+        vm.expectRevert(
+            _hookError(
+                IHooks.beforeRemoveLiquidity.selector,
+                abi.encodeWithSelector(IOathHook.PriceMovedThisBlock.selector, START_TICK + 51, START_TICK)
+            )
+        );
+        _settleAs(keeper);
+        assertEq(uint8(vault.state()), uint8(IOathVault.State.ACTIVE), "still unsettled");
+
+        _nextBlock(12);
+        IOathVault.EpochResult memory expected = _expected();
+        _settleAs(keeper);
+        assertEq(abi.encode(vault.getResult(0)), abi.encode(expected));
+        assertEq(vault.getResult(0).endTick, START_TICK, "marked at the TWAP, not the moved spot");
     }
 
     // ---------------------------------------------------------------- unwind and reopen
@@ -213,6 +403,16 @@ contract OathVaultSettleTest is OathVaultTestBase {
 
     // ---------------------------------------------------------------- helpers
 
+    /// @dev No `BondExhausted` among the logs recorded since `vm.recordLogs()`.
+    function _assertNoBondExhausted() internal view {
+        Vm.Log[] memory logs = vm.getRecordedLogs();
+        for (uint256 i; i < logs.length; ++i) {
+            if (logs[i].emitter == address(vault)) {
+                assertTrue(logs[i].topics[0] != IOathVault.BondExhausted.selector, "no BondExhausted");
+            }
+        }
+    }
+
     /// @dev OPEN preview: `(value(idle0, idle1, spot), same, 0)`.
     function _assertOpenPreview() internal view {
         assertEq(uint8(vault.state()), uint8(IOathVault.State.OPEN));
@@ -292,5 +492,36 @@ contract OathVaultSettleTest is OathVaultTestBase {
         r.startTick = b.startTick;
         r.navStart = b.navStart;
         r.bondAfter = vault.bondBalance() - r.payout;
+    }
+}
+
+/// @notice Settlement of a native-ETH vault: the unwind takes ETH from the PoolManager through `receive`.
+contract OathVaultSettleNativeTest is OathVaultTestBase {
+    function setUp() public override {
+        super.setUp();
+        _createVault(CurrencyLibrary.ADDRESS_ZERO);
+        _seedPool(POOL_LIQUIDITY);
+        _fundWorkedExample();
+        _wait(1 hours);
+    }
+
+    function test_settle_nativeEth() public {
+        _startEpoch(RANGE_LOWER, RANGE_UPPER, _noSwap());
+        uint256 endsAt = _time() + 7 days;
+        uint256 ethBefore = address(vault).balance;
+        vm.roll(_block() + 1);
+        vm.warp(endsAt);
+        vault.settle();
+
+        IOathVault.EpochResult memory r = vault.getResult(0);
+        assertEq(uint8(vault.state()), uint8(IOathVault.State.OPEN));
+        assertEq(_poolPositionLiquidity(RANGE_LOWER, RANGE_UPPER), 0, "unwound");
+        assertGt(address(vault).balance, ethBefore, "ETH taken back from the pool");
+        assertEq(vault.idle0(), address(vault).balance);
+        assertEq(
+            ValuationLib.value(vault.idle0(), vault.idle1() - r.payout, TickMath.getSqrtPriceAtTick(r.endTick)),
+            r.navEnd,
+            "NAV_E = what the vault holds"
+        );
     }
 }
