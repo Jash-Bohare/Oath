@@ -45,6 +45,8 @@ contract DemoReplayForkTest is Test {
         (int24 l, int24 u,) = vault.positionInfo();
         assertEq(l, lower, "Tight range lower");
         assertEq(u, upper, "Tight range upper");
+        assertEq(replay.rebalanceCount(), 0, "Tight never rebalances");
+        assertEq(vault.lastReposition(), r.start);
 
         // Price mode leaves the Oath pool at the last recorded price of the replayed span.
         (uint160 sqrtPriceX96,,,) = MANAGER.getSlot0(vault.poolId());
@@ -58,6 +60,62 @@ contract DemoReplayForkTest is Test {
         for (uint256 i; i < timestamps.length && timestamps[i] <= until; ++i) {
             price = prices[i];
         }
+    }
+
+    /// @dev Two epochs of Recentering. Every rebalance obeys the rule: after the cooldown, before the epoch end,
+    ///      ±300 ticks wide. The second epoch starts after a 30-minute open window from the first settlement, with
+    ///      the bond topped up to 10% of its start NAV. Its end (seed time + 49 h) falls on an hourly sample, which
+    ///      must show the live mark before settlement.
+    function test_replay_recenteringTwoEpochs() public {
+        replay.simulate(WINDOW, LAYOUT, Replay.Strategy.Recentering, false, 2 * ONE_EPOCH);
+        OathVault vault = replay.vault();
+        assertEq(replay.priceMisses(), 0);
+        assertEq(replay.epochCount(), 2, "two epochs");
+        IOathVault.EpochResult memory r0 = replay.epoch(0);
+        IOathVault.EpochResult memory r1 = replay.epoch(1);
+        assertEq(abi.encode(r0), abi.encode(vault.getResult(0)));
+        assertEq(abi.encode(r1), abi.encode(vault.getResult(1)));
+        assertEq(r1.start, uint256(r0.end) + 30 minutes, "next start after the open window from settlement");
+
+        uint256 n = replay.rebalanceCount();
+        assertGt(n, 0, "the price left the inner band");
+        uint256 previous;
+        for (uint256 i; i < n; ++i) {
+            uint256 t = replay.rebalanceTime(i);
+            IOathVault.EpochResult memory r = t < r0.end ? r0 : r1;
+            assertGe(t, uint256(r.start) + 1 hours, "cooldown after the start");
+            assertLt(t, r.end, "before the epoch end");
+            if (i > 0 && previous >= r.start) assertGe(t, previous + 1 hours, "cooldown between rebalances");
+            previous = t;
+        }
+        (int24 l, int24 u,) = vault.positionInfo();
+        assertEq(u - l, 600, "+-300 ticks");
+        assertEq(replay.centre(), l + 300);
+
+        // The bond covered 10% of each start NAV; posted minus payouts is what is left.
+        assertGe(r0.bondAfter + r0.payout, r0.navStart / 10);
+        assertGe(r1.bondAfter + r1.payout, r1.navStart / 10);
+        assertEq(replay.bondPosted() - r0.payout - r1.payout, vault.bondBalance(), "bond reconciles");
+
+        // 50 hourly samples over 49 hours; the last one, at the second epoch's end, precedes its settlement.
+        assertEq(replay.sampleCount(), 50);
+        Replay.Sample memory atEnd = replay.sample(49);
+        assertEq(atEnd.t, r1.end, "a sample at the epoch end");
+        assertTrue(atEnd.navLive != atEnd.benchLive, "live mark of the running epoch, not the reopened vault");
+    }
+
+    /// @dev Wide: one epoch on ±3,000 ticks, never rebalanced.
+    function test_replay_wide() public {
+        replay.simulate(WINDOW, LAYOUT, Replay.Strategy.Wide, false, ONE_EPOCH);
+        OathVault vault = replay.vault();
+        assertEq(replay.epochCount(), 1);
+        IOathVault.EpochResult memory r = replay.epoch(0);
+        (int24 lower, int24 upper) = DemoLib.rangeAround(r.startTick, 3_000, 10);
+        (int24 l, int24 u,) = vault.positionInfo();
+        assertEq(l, lower);
+        assertEq(u, upper);
+        assertEq(replay.rebalanceCount(), 0, "Wide never rebalances");
+        assertEq(vault.lastReposition(), r.start);
     }
 
     function test_replay_tightAmountAnchored() public {
