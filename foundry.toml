@@ -24,6 +24,11 @@ runs = 64
 depth = 200
 fail_on_revert = true
 
+[rpc_endpoints]
+# Fork tests (test/fork) pin their blocks through this endpoint; run them with
+# forge test --match-path "test/fork/*" --fork-url $ETH_RPC_URL
+mainnet = "${ETH_RPC_URL}"
+
 [fmt]
 line_length = 120
 
