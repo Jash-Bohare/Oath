@@ -1,0 +1,46 @@
+{
+  "head": 26439300,
+  "weeks": 8,
+  "step": 300,
+  "samples": 1345,
+  "maxRangeBps": 250.0,
+  "candidates": 583,
+  "windows": [
+    {
+      "name": "2026-11-06T18_2026-11-08T20",
+      "fromBlock": 26357700,
+      "toBlock": 26372700,
+      "fromTimestamp": 1793990879,
+      "toTimestamp": 1794171539,
+      "hours": 50.18,
+      "epochs": 2,
+      "rangeBps": 102.1,
+      "low": 2223.53,
+      "high": 2246.24
+    },
+    {
+      "name": "2026-10-30T22_2026-11-02T00",
+      "fromBlock": 26308500,
+      "toBlock": 26323500,
+      "fromTimestamp": 1793398547,
+      "toTimestamp": 1793579231,
+      "hours": 50.19,
+      "epochs": 2,
+      "rangeBps": 156.1,
+      "low": 2236.23,
+      "high": 2271.14
+    },
+    {
+      "name": "2026-10-05T00_2026-10-07T01",
+      "fromBlock": 26122500,
+      "toBlock": 26137200,
+      "fromTimestamp": 1791159143,
+      "toTimestamp": 1791336239,
+      "hours": 49.19,
+      "epochs": 2,
+      "rangeBps": 171.3,
+      "low": 2685.9,
+      "high": 2731.91
+    }
+  ]
+}
